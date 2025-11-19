@@ -88,6 +88,31 @@ def update_user_role(user_id: int, role: str, max_days: Optional[int] = None) ->
                 )
         conn.commit()
 
+def list_users() -> List[Dict[str, Any]]:
+    """
+    Возвращает список всех пользователей для админа.
+    Сортируем по роли и имени.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM users
+                ORDER BY
+                    CASE role
+                        WHEN 'admin' THEN 0
+                        WHEN 'accountant' THEN 1
+                        WHEN 'manager' THEN 2
+                        WHEN 'pending' THEN 3
+                        WHEN 'blocked' THEN 4
+                        ELSE 5
+                    END,
+                    full_name
+                """
+            )
+            return cur.fetchall()
+
 
 def list_pending_users() -> List[Dict[str, Any]]:
     with get_connection() as conn:

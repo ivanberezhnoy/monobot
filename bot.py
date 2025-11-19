@@ -36,6 +36,7 @@ from db import (
     insert_account,
     list_accounts_by_org,
     list_all_active_accounts,
+    list_users,
 )
 from monobank_api import (
     unix_from_str,
@@ -76,7 +77,7 @@ def get_available_accounts_for_user(user_row: Dict[str, Any]) -> List[Dict[str, 
     Для admin: возвращаем все активные счета.
     Для остальных: только те, что есть в user_accounts.
     """
-    if user_row["role"] == "admin":
+    if user_row["role"] in ("admin", "accountant"):
         return list_all_active_accounts()
     return get_accounts_for_user(user_row["id"])
 
@@ -153,61 +154,105 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- обработка approve от админа ---
-
 async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработка кнопок одобрения нового пользователя:
+    callback_data формата: 'approve:<role>:<user_id>'
+    где <role> ∈ { manager, accountant, admin, blocked, pending }
+    """
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # "approve:role:user_id"
+    data = query.data  # пример: "approve:manager:123456789"
     try:
-        _, role, uid_str = data.split(":")
+        prefix, role, uid_str = data.split(":")
         uid = int(uid_str)
     except Exception:
-        await query.edit_message_text("Некорректные данные callback.")
+        await query.edit_message_text("Некорректные данные approve callback.")
         return
 
+    # Проверяем, что нажимающий — админ
     from_user = update.effective_user
     if not is_admin(from_user.id):
-        await query.edit_message_text("⛔ Только администратор может менять роли.")
+        await query.edit_message_text("⛔ Только администратор может одобрять пользователей.")
         return
 
-    max_days = None
+    # Определяем max_days по роли
     if role == "manager":
         max_days = 7
-    elif role == "accountant":
+    elif role in ("accountant", "admin"):
         max_days = 0
-    elif role == "admin":
+    elif role == "pending":
+        max_days = 3
+    else:  # blocked и прочие
         max_days = 0
 
+    # Обновляем роль пользователя в БД
     update_user_role(uid, role, max_days=max_days)
 
+    u = get_user(uid)
+
+    uname = ""
+    if u and u.get("username"):
+        uname = f"@{u['username']}"
+
+    # Сообщение админу (тому, кто нажал кнопку)
     await query.edit_message_text(
-        f"Роль пользователя {uid} установлена: {role}"
+        f"✅ Роль пользователя {uid} {uname} установлена: `{role}`",
+        parse_mode="Markdown",
     )
 
-    # уведомить пользователя
+    # Пытаемся уведомить самого пользователя
     try:
-        if role == "blocked":
-            msg = "⛔ Вам отказано в доступе к боту."
-        elif role in ("manager", "accountant", "admin"):
-            msg = "✅ Вам предоставлен доступ к боту."
-        else:
-            msg = f"Ваша роль изменена на {role}."
+        from telegram import ReplyKeyboardRemove
 
-        await context.bot.send_message(chat_id=uid, text=msg)
+        if role == "blocked":
+            txt = "⛔ Вам отказано в доступе к боту. Обратитесь к администратору."
+            await context.bot.send_message(
+                chat_id=uid,
+                text=txt,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        elif role in ("manager", "accountant", "admin"):
+            txt = "✅ Вам предоставлен доступ к боту."
+            await context.bot.send_message(
+                chat_id=uid,
+                text=txt,
+                reply_markup=build_main_menu(role),
+            )
+        elif role == "pending":
+            txt = "Ваш статус в боте: pending. Ожидайте решения администратора."
+            await context.bot.send_message(
+                chat_id=uid,
+                text=txt,
+            )
+        else:
+            txt = f"Ваша роль в боте изменена на: {role}."
+            await context.bot.send_message(
+                chat_id=uid,
+                text=txt,
+            )
+
     except Exception:
+        # Если пользователь недоступен (не писал боту / блокировал) — тихо игнорируем
         pass
+
 
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обработка нажатий в админ-меню (callback_data начинается с 'admin:').
-    Поддерживаем:
-      - admin:add_org      — добавить организацию
-      - admin:accounts     — выбрать организацию для работы со счетами
-      - admin:acc_org:<id> — подменю по конкретной организации
-      - admin:acc_add:<id> — запуск диалога добавления счёта
-      - admin:acc_list:<id>— список счетов по организации
-      - admin:acc_info:<id>— подробная информация по счёту
+
+    Поддерживает:
+      - admin:add_org         — добавление организации
+      - admin:accounts        — выбор организации для работы со счетами
+      - admin:acc_org:<id>    — подменю по организации
+      - admin:acc_add:<id>    — диалог добавления счёта
+      - admin:acc_list:<id>   — список счетов по организации
+      - admin:acc_info:<id>   — информация по счёту
+
+      - admin:users           — список пользователей
+      - admin:user:<uid>      — карточка пользователя + кнопки ролей
+      - admin:userrole:<role>:<uid> — смена роли пользователю
     """
     query = update.callback_query
     await query.answer()
@@ -217,7 +262,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("⛔ Только администратор может пользоваться этим меню.")
         return
 
-    data = query.data  # например 'admin:add_org' или 'admin:acc_org:1'
+    data = query.data  # например 'admin:add_org', 'admin:users', 'admin:user:123', 'admin:userrole:manager:123'
     parts = data.split(":")
     if len(parts) < 2:
         await query.edit_message_text("Некорректные данные admin callback.")
@@ -235,7 +280,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # --- Работа со счетами: шаг 1 — выбор организации ---
+    # --- Работа со счетами: выбор организации ---
     if action == "accounts":
         orgs = list_organizations()
         if not orgs:
@@ -259,18 +304,60 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # дальнейшие действия требуют 3-й части в callback_data
-    if len(parts) < 3:
-        await query.edit_message_text("Некорректные данные admin callback (ожидается ID).")
+    # --- Список пользователей ---
+    if action == "users":
+        users = list_users()
+        if not users:
+            await query.edit_message_text("Пользователей пока нет.")
+            return
+
+        keyboard = []
+        for u in users:
+            role = u["role"]
+            if role == "admin":
+                role_icon = "👑"
+            elif role == "accountant":
+                role_icon = "📊"
+            elif role == "manager":
+                role_icon = "👔"
+            elif role == "pending":
+                role_icon = "👤"
+            elif role == "blocked":
+                role_icon = "⛔"
+            else:
+                role_icon = "❓"
+
+            name = u["full_name"] or ""
+            uname = f"@{u['username']}" if u["username"] else ""
+            label = f"{role_icon} {u['id']} – {name} {uname}".strip()
+
+            keyboard.append([
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"admin:user:{u['id']}",
+                )
+            ])
+
+        await query.edit_message_text(
+            "👥 Список пользователей:\nВыберите пользователя, чтобы изменить его роль.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
         return
 
-    try:
-        obj_id = int(parts[2])
-    except ValueError:
-        await query.edit_message_text("Некорректный ID в admin callback.")
-        return
+    # --- дальше нужны ID объекта в parts[2] или больше ---
+    if action in ("acc_org", "acc_add", "acc_list", "acc_info", "user"):
+        if len(parts) < 3:
+            await query.edit_message_text("Некорректные данные admin callback (ожидается ID).")
+            return
+        try:
+            obj_id = int(parts[2])
+        except ValueError:
+            await query.edit_message_text("Некорректный ID в admin callback.")
+            return
+    else:
+        obj_id = None  # по умолчанию
 
-    # --- Подменю по конкретной организации ---
+    # --- Подменю по организации ---
     if action == "acc_org":
         org = get_organization_by_id(obj_id)
         if not org:
@@ -330,7 +417,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         accounts = list_accounts_by_org(org["id"])
         if not accounts:
             await query.edit_message_text(
-                f"У организации *{org['name']}* пока нет ни одного счёта.",
+                f"У организации *{org['name']}* пока нет ни одной карты.",
                 parse_mode="Markdown",
             )
             return
@@ -345,31 +432,31 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             ])
 
         await query.edit_message_text(
-            f"Счета организации *{org['name']}*:\n"
-            "Выберите счёт, чтобы посмотреть подробную информацию.",
+            f"Карты организации *{org['name']}*:\n"
+            "Выберите карту, чтобы посмотреть подробную информацию.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    # --- Подробная информация по счёту ---
+    # --- Подробная информация по карте ---
     if action == "acc_info":
         acc = get_account_by_id(obj_id)
         if not acc:
-            await query.edit_message_text("Счёт не найден.")
+            await query.edit_message_text("Карта не найдена.")
             return
 
         org = get_organization_by_id(acc["organization_id"])
         org_name = org["name"] if org else "(неизвестно)"
 
         text = (
-            f"💳 *Счёт:* {acc['name']}\n"
+            f"💳 *Карта:* {acc['name']}\n"
             f"🏢 Организация: {org_name}\n"
-            f"ID счёта (в БД): `{acc['id']}`\n"
+            f"ID карты (в БД): `{acc['id']}`\n"
             f"Monobank account id: `{acc['mono_account_id']}`\n"
             f"IBAN: `{acc['iban'] or ''}`\n"
             f"Код валюты: `{acc['currency_code'] or ''}`\n"
-            f"Активен: {'✅' if acc['is_active'] else '❌'}"
+            f"Активна: {'✅' if acc['is_active'] else '❌'}"
         )
 
         await query.edit_message_text(
@@ -378,8 +465,110 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # если действие неизвестно
+    # --- Карточка пользователя ---
+    if action == "user":
+        u = get_user(obj_id)
+        if not u:
+            await query.edit_message_text("Пользователь не найден.")
+            return
+
+        role = u["role"]
+        max_days = u["max_days"]
+
+        uname = f"@{u['username']}" if u["username"] else "(нет username)"
+        text = (
+            f"👤 Пользователь: *{u['full_name'] or ''}*\n"
+            f"ID: `{u['id']}`\n"
+            f"Username: {uname}\n"
+            f"Роль: `{role}`\n"
+            f"MaxDays: {max_days}\n\n"
+            "Выберите новую роль:"
+        )
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👤 Pending",   callback_data=f"admin:userrole:pending:{u['id']}"),
+                InlineKeyboardButton("👔 Менеджер",  callback_data=f"admin:userrole:manager:{u['id']}"),
+            ],
+            [
+                InlineKeyboardButton("📊 Бухгалтер", callback_data=f"admin:userrole:accountant:{u['id']}"),
+                InlineKeyboardButton("👑 Админ",     callback_data=f"admin:userrole:admin:{u['id']}"),
+            ],
+            [
+                InlineKeyboardButton("⛔ Blocked",   callback_data=f"admin:userrole:blocked:{u['id']}"),
+            ],
+        ])
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # --- Смена роли пользователю ---
+    if action == "userrole":
+        if len(parts) < 4:
+            await query.edit_message_text("Некорректные данные admin:userrole callback.")
+            return
+
+        new_role = parts[2]
+        try:
+            target_id = int(parts[3])
+        except ValueError:
+            await query.edit_message_text("Некорректный ID пользователя.")
+            return
+
+        # Определяем max_days по роли
+        if new_role == "manager":
+            max_days = 7
+        elif new_role in ("accountant", "admin"):
+            max_days = 0
+        elif new_role == "pending":
+            max_days = 3
+        else:  # blocked и всё прочее
+            max_days = 0
+
+        update_user_role(target_id, new_role, max_days=max_days)
+
+        u = get_user(target_id)
+        uname = f"@{u['username']}" if u and u["username"] else ""
+
+        await query.edit_message_text(
+            f"✅ Роль пользователя {target_id} {uname} изменена на `{new_role}`.",
+            parse_mode="Markdown",
+        )
+
+        # Пытаемся обновить меню у самого пользователя
+        try:
+            # текст можно любой
+            txt = f"Ваша роль в боте изменена на: {new_role}."
+            from telegram import ReplyKeyboardRemove
+
+            # если пользователь заблокирован — лучше убрать меню
+            if new_role == "blocked":
+                await query.bot.send_message(
+                    chat_id=target_id,
+                    text=txt,
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            else:
+                # отправляем новое главное меню с учётом роли
+                from bot import build_main_menu  # если build_main_menu в этом же файле, импорт не нужен
+                await query.bot.send_message(
+                    chat_id=target_id,
+                    text=txt,
+                    reply_markup=build_main_menu(new_role),
+                )
+        except Exception:
+            pass
+
+        return
+
+
+    # --- неизвестное действие ---
     await query.edit_message_text("Эта функция админ-меню ещё не реализована.")
+
 
 # --- общий guard для всех команд/меню ---
 
@@ -958,9 +1147,6 @@ async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]):
     """
     Главное меню администратора.
-    Сейчас:
-      - ➕ Добавить организацию
-      - 🏦 Счета (управление счетами по организациям)
     """
     keyboard = InlineKeyboardMarkup([
         [
@@ -969,14 +1155,22 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         [
             InlineKeyboardButton("🏦 Счета", callback_data="admin:accounts"),
         ],
+        [
+            InlineKeyboardButton("👥 Пользователи", callback_data="admin:users"),
+        ],
     ])
 
-    await update.message.reply_text(
-        "🛠 Меню администратора:",
-        reply_markup=keyboard,
-    )
-
-
+    # сюда может прийти как message, так и callback_query
+    if update.message:
+        await update.message.reply_text(
+            "🛠 Меню администратора:",
+            reply_markup=keyboard,
+        )
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(
+            "🛠 Меню администратора:",
+            reply_markup=keyboard,
+        )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
