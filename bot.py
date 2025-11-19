@@ -1,19 +1,19 @@
 # bot.py
 
 import os
-from typing import List, Dict, Any
 import time
+import logging
+from typing import List, Dict, Any
+
 from requests import HTTPError
-from telegram.ext import ContextTypes
-
-STATEMENT_MIN_INTERVAL = 60
-
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    CallbackQuery,
+    Message,
 )
 from telegram.ext import (
     Application,
@@ -36,12 +36,13 @@ from db import (
     list_admin_ids,
     is_admin,
     insert_organization,
-    insert_organization,
     list_organizations,
     insert_account,
     list_accounts_by_org,
     list_all_active_accounts,
     list_users,
+    grant_account_to_user,
+    revoke_account_from_user,
 )
 from monobank_api import (
     unix_from_str,
@@ -50,14 +51,16 @@ from monobank_api import (
 )
 from report_xlsx import write_xlsx
 
-import logging
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-# --- Вспомогательные функции ---
+STATEMENT_MIN_INTERVAL = 60  # секунды – лимит Monobank на выписку по одному токену
+
+
+# --- Вспомогательные функции / меню ---
+
 
 def build_main_menu(role: str) -> ReplyKeyboardMarkup:
     buttons = [
@@ -77,20 +80,22 @@ def user_has_unlimited_days(user_row: Dict[str, Any]) -> bool:
         return True
     return user_row["max_days"] <= 0
 
+
 def get_available_accounts_for_user(user_row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Для admin: возвращаем все активные счета.
+    Для admin/accountant: возвращаем все активные счета.
     Для остальных: только те, что есть в user_accounts.
     """
     if user_row["role"] in ("admin", "accountant"):
         return list_all_active_accounts()
     return get_accounts_for_user(user_row["id"])
 
+
 def get_statement_wait_left(context: ContextTypes.DEFAULT_TYPE, token: str) -> int:
     """
     Возвращает, сколько секунд ещё нужно подождать перед следующей выпиской
     по данному токену. 0 = можно вызывать сразу.
-    ВАЖНО: НИЧЕГО не обновляет, только читает.
+    НИЧЕГО не обновляет.
     """
     bot_data = context.application.bot_data
     key = f"last_statement_call_ts:{token}"
@@ -110,13 +115,46 @@ def get_statement_wait_left(context: ContextTypes.DEFAULT_TYPE, token: str) -> i
 def mark_statement_call(context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
     """
     Отмечает, что по этому токену только что делали вызов выписки.
-    ВАЖНО: вызывать ТОЛЬКО после успешного fetch_statement.
+    Вызывать ТОЛЬКО после успешного fetch_statement.
     """
     bot_data = context.application.bot_data
     key = f"last_statement_call_ts:{token}"
     bot_data[key] = time.time()
 
+
+async def _reply(source, text: str):
+    """
+    Универсальный ответ:
+    - Update.message
+    - CallbackQuery.message
+    - Message
+    """
+    if isinstance(source, Update):
+        if source.message:
+            await source.message.reply_text(text)
+        elif source.callback_query and source.callback_query.message:
+            await source.callback_query.message.reply_text(text)
+        return
+
+    if isinstance(source, CallbackQuery):
+        if source.message:
+            await source.message.reply_text(text)
+        return
+
+    if isinstance(source, Message):
+        await source.reply_text(text)
+        return
+
+    if hasattr(source, "message") and source.message:
+        await source.message.reply_text(text)
+        return
+
+    # если совсем непонятно, можно ничего не делать или залогировать
+    logging.warning("Unsupported source passed to _reply: %r", type(source))
+
+
 # --- /start ---
+
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
@@ -156,7 +194,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # уведомить всех админов
     admin_ids = list_admin_ids()
     if not admin_ids:
-        # пока нет ни одного админа в БД
         return
 
     text = (
@@ -166,15 +203,26 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Имя: {tg_user.full_name}\n\n"
         "Выберите роль:"
     )
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("✅ Менеджер", callback_data=f"approve:manager:{user_id}"),
-            InlineKeyboardButton("📊 Бухгалтер", callback_data=f"approve:accountant:{user_id}"),
-        ],
-        [
-            InlineKeyboardButton("🛑 Заблокировать", callback_data=f"approve:blocked:{user_id}"),
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "✅ Менеджер",
+                    callback_data=f"approve:manager:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    "📊 Бухгалтер",
+                    callback_data=f"approve:accountant:{user_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🛑 Заблокировать",
+                    callback_data=f"approve:blocked:{user_id}",
+                ),
+            ],
+        ]
+    )
 
     for admin_id in admin_ids:
         try:
@@ -187,17 +235,242 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# --- обработка approve от админа ---
+# --- Админ: управление счетами пользователя ---
+
+
+ADMIN_USER_ACCOUNTS_PREFIX = "admin_user_accounts"  # открыть меню счетов пользователя
+ADMIN_USER_ACCOUNTS_ADD_PREFIX = "admin_user_accounts_add"  # выбор счета для добавления
+ADMIN_USER_ACCOUNTS_DEL_PREFIX = "admin_user_accounts_del"  # выбор счета для удаления
+
+
+async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # формат "admin_user_accounts:<user_id>"
+    _, user_id_str = data.split(":", 1)
+    user_id = int(user_id_str)
+
+    user = get_user(user_id)
+    if not user:
+        await query.edit_message_text("Пользователь не найден.")
+        return
+
+    user_accounts = get_accounts_for_user(user_id)  # счета, доступные этому юзеру
+    all_accounts = list_all_active_accounts()  # все активные счета
+
+    user_acc_ids = {acc["id"] for acc in user_accounts}
+
+    lines: list[str] = [f"Пользователь: {user['full_name']}", "", "Доступные счета:"]
+
+    if not user_accounts:
+        lines.append("  — нет ни одного счета")
+    else:
+        for acc in user_accounts:
+            org = get_organization_by_id(acc["organization_id"])
+            org_name = org["name"] if org else "?"
+            lines.append(f"  • {org_name} – {acc['name']}")
+
+    text = "\n".join(lines)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➕ Добавить счёт",
+                callback_data=f"{ADMIN_USER_ACCOUNTS_ADD_PREFIX}:{user_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "➖ Удалить счёт",
+                callback_data=f"{ADMIN_USER_ACCOUNTS_DEL_PREFIX}:{user_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:user:{user_id}"),
+        ],
+    ]
+
+    await query.edit_message_text(
+        text=text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def admin_user_accounts_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # "admin_user_accounts_add:<user_id>" или "...:<user_id>:<account_id>"
+    parts = data.split(":")
+    if len(parts) == 2:
+        # шаг 1: показать список счетов для добавления
+        _, user_id_str = parts
+        user_id = int(user_id_str)
+
+        user_accounts = get_accounts_for_user(user_id)
+        all_accounts = list_all_active_accounts()
+
+        user_acc_ids = {acc["id"] for acc in user_accounts}
+
+        # счета, которых у пользователя ещё нет
+        candidates = [acc for acc in all_accounts if acc["id"] not in user_acc_ids]
+
+        if not candidates:
+            await query.edit_message_text(
+                "У пользователя уже есть доступ ко всем счетам.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        keyboard_rows = []
+        for acc in candidates:
+            org = get_organization_by_id(acc["organization_id"])
+            org_name = org["name"] if org else "?"
+            label = f"{org_name} – {acc['name']}"
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_ADD_PREFIX}:{user_id}:{acc['id']}",
+                    )
+                ]
+            )
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                )
+            ]
+        )
+
+        await query.edit_message_text(
+            text="Выберите счёт, который нужно добавить пользователю:",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+    elif len(parts) == 3:
+        # шаг 2: реально добавляем счёт
+        _, user_id_str, acc_id_str = parts
+        user_id = int(user_id_str)
+        account_id = int(acc_id_str)
+
+        grant_account_to_user(user_id, account_id)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                    )
+                ]
+            ]
+        )
+        await query.edit_message_text("Счёт добавлен пользователю.", reply_markup=keyboard)
+
+
+async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # "admin_user_accounts_del:<user_id>" или "...:<user_id>:<account_id>"
+    parts = data.split(":")
+    if len(parts) == 2:
+        # шаг 1: показать список счетов для удаления
+        _, user_id_str = parts
+        user_id = int(user_id_str)
+
+        user_accounts = get_accounts_for_user(user_id)
+
+        if not user_accounts:
+            await query.edit_message_text(
+                "У пользователя нет счетов для удаления.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        keyboard_rows = []
+        for acc in user_accounts:
+            org = get_organization_by_id(acc["organization_id"])
+            org_name = org["name"] if org else "?"
+            label = f"{org_name} – {acc['name']}"
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_DEL_PREFIX}:{user_id}:{acc['id']}",
+                    )
+                ]
+            )
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                )
+            ]
+        )
+
+        await query.edit_message_text(
+            text="Выберите счёт, который нужно удалить у пользователя:",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+    elif len(parts) == 3:
+        # шаг 2: реально удаляем счёт
+        _, user_id_str, acc_id_str = parts
+        user_id = int(user_id_str)
+        account_id = int(acc_id_str)
+
+        revoke_account_from_user(user_id, account_id)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                    )
+                ]
+            ]
+        )
+        await query.edit_message_text("Счёт удалён у пользователя.", reply_markup=keyboard)
+
+
+# --- approve от админа ---
+
+
 async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обработка кнопок одобрения нового пользователя:
-    callback_data формата: 'approve:<role>:<user_id>'
-    где <role> ∈ { manager, accountant, admin, blocked, pending }
+    callback_data: 'approve:<role>:<user_id>'
     """
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # пример: "approve:manager:123456789"
+    data = query.data
     try:
         prefix, role, uid_str = data.split(":")
         uid = int(uid_str)
@@ -221,16 +494,13 @@ async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT
     else:  # blocked и прочие
         max_days = 0
 
-    # Обновляем роль пользователя в БД
     update_user_role(uid, role, max_days=max_days)
 
     u = get_user(uid)
-
     uname = ""
     if u and u.get("username"):
         uname = f"@{u['username']}"
 
-    # Сообщение админу (тому, кто нажал кнопку)
     await query.edit_message_text(
         f"✅ Роль пользователя {uid} {uname} установлена: `{role}`",
         parse_mode="Markdown",
@@ -268,25 +538,15 @@ async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT
             )
 
     except Exception:
-        # Если пользователь недоступен (не писал боту / блокировал) — тихо игнорируем
         pass
+
+
+# --- Админ-меню ---
 
 
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обработка нажатий в админ-меню (callback_data начинается с 'admin:').
-
-    Поддерживает:
-      - admin:add_org         — добавление организации
-      - admin:accounts        — выбор организации для работы со счетами
-      - admin:acc_org:<id>    — подменю по организации
-      - admin:acc_add:<id>    — диалог добавления счёта
-      - admin:acc_list:<id>   — список счетов по организации
-      - admin:acc_info:<id>   — информация по счёту
-
-      - admin:users           — список пользователей
-      - admin:user:<uid>      — карточка пользователя + кнопки ролей
-      - admin:userrole:<role>:<uid> — смена роли пользователю
     """
     query = update.callback_query
     await query.answer()
@@ -296,7 +556,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("⛔ Только администратор может пользоваться этим меню.")
         return
 
-    data = query.data  # например 'admin:add_org', 'admin:users', 'admin:user:123', 'admin:userrole:manager:123'
+    data = query.data
     parts = data.split(":")
     if len(parts) < 2:
         await query.edit_message_text("Некорректные данные admin callback.")
@@ -325,12 +585,14 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         keyboard = []
         for org in orgs:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🏢 {org['name']}",
-                    callback_data=f"admin:acc_org:{org['id']}",
-                )
-            ])
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"🏢 {org['name']}",
+                        callback_data=f"admin:acc_org:{org['id']}",
+                    )
+                ]
+            )
 
         await query.edit_message_text(
             "Выберите организацию для работы со счетами:",
@@ -365,23 +627,28 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             uname = f"@{u['username']}" if u["username"] else ""
             label = f"{role_icon} {u['id']} – {name} {uname}".strip()
 
-            keyboard.append([
-                InlineKeyboardButton(
-                    label,
-                    callback_data=f"admin:user:{u['id']}",
-                )
-            ])
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"admin:user:{u['id']}",
+                    )
+                ]
+            )
 
         await query.edit_message_text(
-            "👥 Список пользователей:\nВыберите пользователя, чтобы изменить его роль.",
+            "👥 Список пользователей:\n"
+            "Выберите пользователя, чтобы изменить его роль или права по счетам.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    # --- дальше нужны ID объекта в parts[2] или больше ---
+    # --- дальше нужны ID ---
     if action in ("acc_org", "acc_add", "acc_list", "acc_info", "user"):
         if len(parts) < 3:
-            await query.edit_message_text("Некорректные данные admin callback (ожидается ID).")
+            await query.edit_message_text(
+                "Некорректные данные admin callback (ожидается ID)."
+            )
             return
         try:
             obj_id = int(parts[2])
@@ -389,7 +656,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Некорректный ID в admin callback.")
             return
     else:
-        obj_id = None  # по умолчанию
+        obj_id = None
 
     # --- Подменю по организации ---
     if action == "acc_org":
@@ -398,20 +665,22 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Организация не найдена.")
             return
 
-        keyboard = InlineKeyboardMarkup([
+        keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    "➕ Добавить счёт",
-                    callback_data=f"admin:acc_add:{org['id']}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 Список счетов",
-                    callback_data=f"admin:acc_list:{org['id']}",
-                ),
-            ],
-        ])
+                [
+                    InlineKeyboardButton(
+                        "➕ Добавить счёт",
+                        callback_data=f"admin:acc_add:{org['id']}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📋 Список счетов",
+                        callback_data=f"admin:acc_list:{org['id']}",
+                    ),
+                ],
+            ]
+        )
 
         await query.edit_message_text(
             f"Организация: *{org['name']}*\nВыберите действие:",
@@ -458,12 +727,14 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         keyboard = []
         for acc in accounts:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"💳 {acc['name']}",
-                    callback_data=f"admin:acc_info:{acc['id']}",
-                )
-            ])
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"💳 {acc['name']}",
+                        callback_data=f"admin:acc_info:{acc['id']}",
+                    )
+                ]
+            )
 
         await query.edit_message_text(
             f"Карты организации *{org['name']}*:\n"
@@ -516,22 +787,41 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"Username: {uname}\n"
             f"Роль: `{role}`\n"
             f"MaxDays: {max_days}\n\n"
-            "Выберите новую роль:"
+            "Выберите новую роль или управляйте доступом к счетам:"
         )
 
-        kb = InlineKeyboardMarkup([
+        kb = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton("👤 Pending",   callback_data=f"admin:userrole:pending:{u['id']}"),
-                InlineKeyboardButton("👔 Менеджер",  callback_data=f"admin:userrole:manager:{u['id']}"),
-            ],
-            [
-                InlineKeyboardButton("📊 Бухгалтер", callback_data=f"admin:userrole:accountant:{u['id']}"),
-                InlineKeyboardButton("👑 Админ",     callback_data=f"admin:userrole:admin:{u['id']}"),
-            ],
-            [
-                InlineKeyboardButton("⛔ Blocked",   callback_data=f"admin:userrole:blocked:{u['id']}"),
-            ],
-        ])
+                [
+                    InlineKeyboardButton(
+                        "👤 Pending", callback_data=f"admin:userrole:pending:{u['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        "👔 Менеджер", callback_data=f"admin:userrole:manager:{u['id']}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📊 Бухгалтер",
+                        callback_data=f"admin:userrole:accountant:{u['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "👑 Админ", callback_data=f"admin:userrole:admin:{u['id']}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "💳 Счета пользователя",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{u['id']}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⛔ Blocked", callback_data=f"admin:userrole:blocked:{u['id']}"
+                    ),
+                ],
+            ]
+        )
 
         await query.edit_message_text(
             text,
@@ -553,14 +843,13 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Некорректный ID пользователя.")
             return
 
-        # Определяем max_days по роли
         if new_role == "manager":
             max_days = 7
         elif new_role in ("accountant", "admin"):
             max_days = 0
         elif new_role == "pending":
             max_days = 3
-        else:  # blocked и всё прочее
+        else:
             max_days = 0
 
         update_user_role(target_id, new_role, max_days=max_days)
@@ -575,11 +864,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         # Пытаемся обновить меню у самого пользователя
         try:
-            # текст можно любой
-            txt = f"Ваша роль в боте изменена на: {new_role}."
             from telegram import ReplyKeyboardRemove
 
-            # если пользователь заблокирован — лучше убрать меню
+            txt = f"Ваша роль в боте изменена на: {new_role}."
             if new_role == "blocked":
                 await query.bot.send_message(
                     chat_id=target_id,
@@ -587,8 +874,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                     reply_markup=ReplyKeyboardRemove(),
                 )
             else:
-                # отправляем новое главное меню с учётом роли
-                from bot import build_main_menu  # если build_main_menu в этом же файле, импорт не нужен
                 await query.bot.send_message(
                     chat_id=target_id,
                     text=txt,
@@ -599,14 +884,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         return
 
-
-    # --- неизвестное действие ---
     await query.edit_message_text("Эта функция админ-меню ещё не реализована.")
 
 
-# --- общий guard для всех команд/меню ---
+# --- Guard для активного пользователя ---
 
-async def ensure_active_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any] | None:
+
+async def ensure_active_user(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> Dict[str, Any] | None:
     tg_user = update.effective_user
     user_row = get_user(tg_user.id)
     if not user_row:
@@ -628,80 +914,12 @@ async def ensure_active_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return user_row
 
 
-# --- обработчик текстового меню (reply keyboard) ---
-
-async def text_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user_row = await ensure_active_user(update, context)
-    if not user_row:
-        return
-
-    # 3) Админский диалог: добавление организации
-    admin_mode = context.user_data.get("admin_mode")
-    if admin_mode and user_row["role"] == "admin":
-        text = update.message.text.strip()
-
-        # шаг 1: ввод имени организации
-        if admin_mode == "add_org_name":
-            context.user_data["new_org_name"] = text
-            context.user_data["admin_mode"] = "add_org_token"
-            await update.message.reply_text(
-                "Теперь отправьте *токен Monobank* для этой организации:",
-                parse_mode="Markdown",
-            )
-            return
-
-        # шаг 2: ввод токена
-        if admin_mode == "add_org_token":
-            org_name = context.user_data.get("new_org_name", "").strip()
-            token = text.strip()
-
-            if not org_name or not token:
-                await update.message.reply_text(
-                    "Имя организации или токен пустые. Попробуйте ещё раз через меню Администрирования."
-                )
-                # сбрасываем режим
-                context.user_data.pop("admin_mode", None)
-                context.user_data.pop("new_org_name", None)
-                return
-
-            # сохраняем в БД
-            org = insert_organization(org_name, token)
-            context.user_data.pop("admin_mode", None)
-            context.user_data.pop("new_org_name", None)
-
-            await update.message.reply_text(
-                f"✅ Организация добавлена.\n\n"
-                f"ID: {org['id']}\n"
-                f"Имя: {org['name']}",
-            )
-
-            # возвращаемся к админ-меню
-            await handle_admin_menu(update, context, user_row)
-            return
-
-    text = update.message.text.strip()
-
-    if text == "📥 Платежи":
-        await handle_payments_entry(update, context, user_row)
-    elif text == "📄 Выписка":
-        await handle_statement_entry(update, context, user_row)
-    elif text == "🛠 Администрирование" and user_row["role"] == "admin":
-        await handle_admin_menu(update, context, user_row)
-    else:
-        # по умолчанию просто показать меню ещё раз
-        await update.message.reply_text(
-            "Выберите действие из меню:",
-            reply_markup=build_main_menu(user_row["role"]),
-        )
-
-
 # --- Платежи (текстовый вывод) ---
 
-async def handle_payments_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]):
-    # для админа берём все активные карты, для остальных — только из user_accounts
+
+async def handle_payments_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]
+):
     accounts = get_available_accounts_for_user(user_row)
 
     if not accounts:
@@ -710,35 +928,37 @@ async def handle_payments_entry(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # ✅ Если только одна карта — сразу переходим к выбору периода
+    # Если только одна карта — сразу к выбору периода
     if len(accounts) == 1:
         acc = accounts[0]
         await ask_period_for_payments(update, context, user_row, str(acc["id"]))
         return
 
-    # ✅ Если карт несколько — показываем меню: Все карты + список карт
+    # Несколько карт — меню "Все карты" + список карт
     keyboard = []
 
-    # "Все карты"
-    keyboard.append([
-        InlineKeyboardButton(
-            "💳 Все карты",
-            callback_data="pay_acc:all",
-        )
-    ])
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "💳 Все карты",
+                callback_data="pay_acc:all",
+            )
+        ]
+    )
 
-    # Конкретные карты
     for acc in accounts:
         org = get_organization_by_id(acc["organization_id"])
         org_name = org["name"] if org else "?"
         display_name = f"{org_name} – {acc['name']}"
 
-        keyboard.append([
-            InlineKeyboardButton(
-                f"💳 {display_name}",
-                callback_data=f"pay_acc:{acc['id']}",
-            )
-        ])
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"💳 {display_name}",
+                    callback_data=f"pay_acc:{acc['id']}",
+                )
+            ]
+        )
 
     await update.message.reply_text(
         "Выберите карту (или все карты):",
@@ -746,14 +966,12 @@ async def handle_payments_entry(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-
-async def ask_period_for_payments(source, context: ContextTypes.DEFAULT_TYPE,
-                                  user_row: Dict[str, Any], account_key: str):
+async def ask_period_for_payments(
+    source, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any], account_key: str
+):
     """
     account_key: "all" или строковый id карты.
-    source: Update.message или CallbackQuery.
     """
-    # Определяем, что писать в заголовке
     if account_key == "all":
         card_label = "Все доступные карты"
     else:
@@ -765,25 +983,54 @@ async def ask_period_for_payments(source, context: ContextTypes.DEFAULT_TYPE,
         org_name = org["name"] if org else "?"
         card_label = f"{org_name} – {acc['name']}"
 
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("⏱ Последний час", callback_data=f"pay_per:{account_key}:last_hour"),
-        ],
-        [
-            InlineKeyboardButton("📅 Сегодня", callback_data=f"pay_per:{account_key}:today"),
-            InlineKeyboardButton("📅 Вчера", callback_data=f"pay_per:{account_key}:yesterday"),
-        ],
-        [
-            InlineKeyboardButton("✏️ Выбрать период", callback_data=f"pay_per:{account_key}:custom"),
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "⏱ Последний час",
+                    callback_data=f"pay_per:{account_key}:last_hour",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📅 Сегодня", callback_data=f"pay_per:{account_key}:today"
+                ),
+                InlineKeyboardButton(
+                    "📅 Вчера", callback_data=f"pay_per:{account_key}:yesterday"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Выбрать период",
+                    callback_data=f"pay_per:{account_key}:custom",
+                ),
+            ],
+        ]
+    )
 
     text = f"Карта: *{card_label}*\nВыберите период:"
     if hasattr(source, "message") and source.message:
-        await source.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await source.message.reply_text(
+            text, reply_markup=keyboard, parse_mode="Markdown"
+        )
     else:
-        await source.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await source.edit_message_text(
+            text, reply_markup=keyboard, parse_mode="Markdown"
+        )
 
+
+async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_row = get_user(query.from_user.id)
+    if not user_row or not user_allowed_for_menu(user_row):
+        await query.edit_message_text("Нет доступа.")
+        return
+
+    _, acc_key = query.data.split(":")  # "all" или "<id>"
+
+    await ask_period_for_payments(query, context, user_row, acc_key)
 
 
 async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -799,6 +1046,7 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     _, acc_key, mode = query.data.split(":")
 
     from datetime import datetime, timedelta
+
     now = datetime.now()
     today = now.date()
 
@@ -856,7 +1104,7 @@ async def show_payments_for_period(
 
     ignore_ibans = get_ignore_ibans_norm()
 
-    # --- Определяем список карт, по которым собираем платежи ---
+    # --- Список карт ---
     if account_key == "all":
         accounts = get_available_accounts_for_user(user_row)
     else:
@@ -875,7 +1123,7 @@ async def show_payments_for_period(
     all_lines: list[str] = []
     total_ops = 0
 
-    # --- Кеш организаций и сбор всех токенов ---
+    # --- Кеш организаций и сбор токенов ---
     org_cache: Dict[int, Dict[str, Any]] = {}
     tokens: set[str] = set()
 
@@ -905,7 +1153,7 @@ async def show_payments_for_period(
         )
         return
 
-    # --- Проверяем лимит Monobank по всем токенам сразу ---
+    # --- Проверяем лимит Monobank по всем токенам ---
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
         await _reply(
@@ -930,13 +1178,10 @@ async def show_payments_for_period(
         card_label = f"{org_name} – {acc['name']}"
 
         try:
-            # запрос к API Monobank
             items = fetch_statement(token, acc["mono_account_id"], from_ts, to_ts)
-            # успешный вызов — фиксируем время для ЭТОГО токена
             mark_statement_call(context, token)
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
-                # Monobank всё-таки сказал "Too Many Requests"
                 wait_left = get_statement_wait_left(context, token)
                 msg = "Monobank просить не робити виписку частіше, ніж раз на хвилину.\n"
                 if wait_left > 0:
@@ -945,7 +1190,6 @@ async def show_payments_for_period(
                     msg += "Спробуйте ще раз трохи пізніше."
                 await _reply(source, msg)
                 return
-            # остальные ошибки пусть летят наверх (увидишь в логах)
             raise
 
         items = filter_income_and_ignore(items, ignore_ibans)
@@ -954,7 +1198,6 @@ async def show_payments_for_period(
             continue
 
         if account_key == "all":
-            # при "все карты" делаем блок по каждой карте
             all_lines.append(f"💳 {card_label} — приходные операции:")
 
         for it in sorted(items, key=lambda x: int(x.get("time", 0))):
@@ -969,7 +1212,7 @@ async def show_payments_for_period(
             total_ops += 1
 
         if account_key == "all":
-            all_lines.append("")  # пустая строка между картами
+            all_lines.append("")
 
     if total_ops == 0:
         await _reply(source, "Нет приходных операций за выбранный период.")
@@ -979,16 +1222,12 @@ async def show_payments_for_period(
     await _reply(source, text)
 
 
-async def _reply(source, text: str):
-    if hasattr(source, "message") and source.message:
-        await source.message.reply_text(text)
-    else:
-        await source.edit_message_text(text)
-
-
 # --- Выписка (Excel) ---
 
-async def ask_statement_period(source, context: ContextTypes.DEFAULT_TYPE, account: Dict[str, Any] | None):
+
+async def ask_statement_period(
+    source, context: ContextTypes.DEFAULT_TYPE, account: Dict[str, Any] | None
+):
     """
     account:
       - None  → режим "Все карты"
@@ -1001,26 +1240,39 @@ async def ask_statement_period(source, context: ContextTypes.DEFAULT_TYPE, accou
         org_name = org["name"] if org else "?"
         label = f"{org_name} – {account['name']}"
 
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("📅 Сегодня",   callback_data="stmt_per:today"),
-            InlineKeyboardButton("📅 Вчера",     callback_data="stmt_per:yesterday"),
-        ],
-        [
-            InlineKeyboardButton("📅 Прошлые 3 дня", callback_data="stmt_per:last3"),
-        ],
-        [
-            InlineKeyboardButton("✏️ Выбрать период", callback_data="stmt_per:custom"),
-        ],
-    ])
+            [
+                InlineKeyboardButton("📅 Сегодня", callback_data="stmt_per:today"),
+                InlineKeyboardButton("📅 Вчера", callback_data="stmt_per:yesterday"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📅 Прошлые 3 дня", callback_data="stmt_per:last3"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Выбрать период", callback_data="stmt_per:custom"
+                ),
+            ],
+        ]
+    )
 
     text = f"Карта: *{label}*\nВыберите период:"
     if hasattr(source, "message") and source.message:
-        await source.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await source.message.reply_text(
+            text, reply_markup=keyboard, parse_mode="Markdown"
+        )
     else:
-        await source.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await source.edit_message_text(
+            text, reply_markup=keyboard, parse_mode="Markdown"
+        )
 
-async def handle_statement_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]):
+
+async def handle_statement_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]
+):
     accounts = get_available_accounts_for_user(user_row)
 
     if not accounts:
@@ -1029,37 +1281,36 @@ async def handle_statement_entry(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Только одна карта → сразу к выбору периода
     if len(accounts) == 1:
         acc = accounts[0]
         context.user_data["stmt_account_key"] = str(acc["id"])
         await ask_statement_period(update, context, acc)
         return
 
-    # Несколько карт → меню "Все карты" + список карт
     keyboard = []
 
-    # Все карты
-    keyboard.append([
-        InlineKeyboardButton("💳 Все карты", callback_data="stmt_acc:all")
-    ])
+    keyboard.append(
+        [InlineKeyboardButton("💳 Все карты", callback_data="stmt_acc:all")]
+    )
 
     for acc in accounts:
         org = get_organization_by_id(acc["organization_id"])
         org_name = org["name"] if org else "?"
-
         display_name = f"{org_name} – {acc['name']}"
-        keyboard.append([
-            InlineKeyboardButton(
-                f"💳 {display_name}",
-                callback_data=f"stmt_acc:{acc['id']}",
-            )
-        ])
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"💳 {display_name}",
+                    callback_data=f"stmt_acc:{acc['id']}",
+                )
+            ]
+        )
 
     await update.message.reply_text(
         "Выберите карту для выписки (или все карты):",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
 
 async def stmt_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1070,10 +1321,9 @@ async def stmt_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Нет доступа.")
         return
 
-    # data: "stmt_acc:all" или "stmt_acc:<id>"
-    _, acc_key = query.data.split(":")
+    _, acc_key = query.data.split(":")  # "all" или "<id>"
 
-    context.user_data["stmt_account_key"] = acc_key  # "all" или "<id>"
+    context.user_data["stmt_account_key"] = acc_key
 
     if acc_key == "all":
         account = None
@@ -1084,6 +1334,7 @@ async def stmt_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await ask_statement_period(query, context, account)
+
 
 async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1102,6 +1353,7 @@ async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     _, mode = query.data.split(":")
 
     from datetime import datetime, timedelta
+
     now = datetime.now()
     today = now.date()
 
@@ -1146,7 +1398,7 @@ async def generate_and_send_statement(
     source,
     context: ContextTypes.DEFAULT_TYPE,
     user_row: Dict[str, Any],
-    account_key: str,          # "all" или "<id>"
+    account_key: str,  # "all" или "<id>"
     from_ts: int,
     to_ts: int,
     from_raw: str,
@@ -1182,7 +1434,6 @@ async def generate_and_send_statement(
 
     rows: List[Dict[str, Any]] = []
 
-    # --- собираем организации и токены, сразу учитывая is_active ---
     org_cache: Dict[int, Dict[str, Any]] = {}
     tokens: set[str] = set()
 
@@ -1212,7 +1463,6 @@ async def generate_and_send_statement(
         )
         return
 
-    # --- проверяем лимит Monobank по всем токенам сразу ---
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
         await _reply(
@@ -1222,7 +1472,6 @@ async def generate_and_send_statement(
         )
         return
 
-    # --- основной цикл по аккаунтам ---
     for acc in accounts:
         org_id = acc.get("organization_id")
         org = org_cache.get(org_id)
@@ -1234,13 +1483,10 @@ async def generate_and_send_statement(
             continue
 
         try:
-            # запрос к API Monobank
             items = fetch_statement(token, acc["mono_account_id"], from_ts, to_ts)
-            # фиксируем успешный вызов для этого токена
             mark_statement_call(context, token)
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
-                # Monobank всё-таки сказал "Too Many Requests"
                 wait_left = get_statement_wait_left(context, token)
                 msg = "Monobank просить не робити виписку частіше, ніж раз на хвилину.\n"
                 if wait_left > 0:
@@ -1249,7 +1495,6 @@ async def generate_and_send_statement(
                     msg += "Спробуйте ще раз трохи пізніше."
                 await _reply(source, msg)
                 return
-            # остальные ошибки пусть полетят наверх (увидишь в логах)
             raise
 
         items = filter_income_and_ignore(items, ignore_ibans)
@@ -1276,18 +1521,23 @@ async def generate_and_send_statement(
         await _reply(source, "Нет приходных операций за выбранный период.")
         return
 
-    # --- сортировка и формирование XLSX ---
     rows.sort(key=lambda r: (r["_token_id"], r["_account_id"], r["datetime"]))
 
     filename = f"выписка_{from_raw}_{to_raw}.xlsx"
     output_path = os.path.join(os.getcwd(), filename)
     write_xlsx(output_path, rows)
 
-    chat_id = (
-        source.effective_chat.id
-        if hasattr(source, "effective_chat") and source.effective_chat
-        else source.message.chat_id
-    )
+    if hasattr(source, "effective_chat") and source.effective_chat:
+        chat_id = source.effective_chat.id
+    elif hasattr(source, "message") and source.message:
+        chat_id = source.message.chat_id
+    else:
+        # fallback
+        chat_id = None
+
+    if chat_id is None:
+        logging.warning("Cannot determine chat_id for sending statement file")
+        return
 
     await context.bot.send_document(
         chat_id=chat_id,
@@ -1297,41 +1547,28 @@ async def generate_and_send_statement(
     )
 
 
+# --- Админ-меню (entry point) ---
 
-async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
 
-    user_row = get_user(query.from_user.id)
-    if not user_row or not user_allowed_for_menu(user_row):
-        await query.edit_message_text("Нет доступа.")
-        return
-
-    # data: "pay_acc:all" или "pay_acc:<id>"
-    _, acc_key = query.data.split(":")  # acc_key: "all" или "123"
-
-    # Просто передаём acc_key дальше (как строку)
-    await ask_period_for_payments(query, context, user_row, acc_key)
-
-# --- Админ-меню (пока просто заглушка) ---
-
-async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]):
-    """
-    Главное меню администратора.
-    """
-    keyboard = InlineKeyboardMarkup([
+async def handle_admin_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]
+):
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("➕ Добавить организацию", callback_data="admin:add_org"),
-        ],
-        [
-            InlineKeyboardButton("🏦 Счета", callback_data="admin:accounts"),
-        ],
-        [
-            InlineKeyboardButton("👥 Пользователи", callback_data="admin:users"),
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить организацию", callback_data="admin:add_org"
+                ),
+            ],
+            [
+                InlineKeyboardButton("🏦 Счета", callback_data="admin:accounts"),
+            ],
+            [
+                InlineKeyboardButton("👥 Пользователи", callback_data="admin:users"),
+            ],
+        ]
+    )
 
-    # сюда может прийти как message, так и callback_query
     if update.message:
         await update.message.reply_text(
             "🛠 Меню администратора:",
@@ -1343,28 +1580,21 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             reply_markup=keyboard,
         )
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Общий обработчик всех текстовых сообщений (кроме команд):
 
-    1) Если пользователь pending/blocked — ничего не делаем (ensure_active_user вернёт None).
-    2) Если admin_mode установлен -> обрабатываем админский диалог (добавление организации).
-    3) Если ждём кастомные даты для Платежей -> парсим их.
-    4) Если ждём кастомные даты для Выписки -> парсим их.
-    5) Иначе — это нажатие кнопки меню (📥 Платежи / 📄 Выписка / 🛠 Администрирование).
-    """
+# --- Общий текстовый хендлер ---
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
     text = (update.message.text or "").strip()
     logging.info("📩 TEXT: '%s', user_data=%s", text, dict(context.user_data))
 
-    # 1) Проверяем, что пользователь активен (не pending / blocked)
     user_row = await ensure_active_user(update, context)
     if not user_row:
         return
 
-    # 2) Админский диалог (добавление организации / добавление счёта)
     admin_mode = context.user_data.get("admin_mode")
     if admin_mode and user_row["role"] == "admin":
         # --- добавление организации ---
@@ -1404,7 +1634,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_admin_menu(update, context, user_row)
             return
 
-        # --- добавление счёта: шаг 1 — mono_account_id ---
+        # --- добавление счёта ---
         if admin_mode == "add_account_mono_id":
             context.user_data["acc_mono_id"] = text.strip()
             context.user_data["admin_mode"] = "add_account_name"
@@ -1415,7 +1645,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- добавление счёта: шаг 2 — имя ---
         if admin_mode == "add_account_name":
             context.user_data["acc_name"] = text.strip()
             context.user_data["admin_mode"] = "add_account_iban"
@@ -1426,7 +1655,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- добавление счёта: шаг 3 — IBAN ---
         if admin_mode == "add_account_iban":
             iban = text.strip()
             if iban == "-":
@@ -1440,7 +1668,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- добавление счёта: шаг 4 — код валюты ---
         if admin_mode == "add_account_currency":
             try:
                 currency_code = int(text.strip())
@@ -1456,7 +1683,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acc_iban = context.user_data.get("acc_iban")
 
             if not org_id or not mono_id or not acc_name:
-                # что-то пошло не так — сбросим состояние
                 context.user_data.pop("admin_mode", None)
                 context.user_data.pop("acc_org_id", None)
                 context.user_data.pop("acc_mono_id", None)
@@ -1475,7 +1701,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 currency_code=currency_code,
             )
 
-            # чистим состояние
             context.user_data.pop("admin_mode", None)
             context.user_data.pop("acc_org_id", None)
             context.user_data.pop("acc_mono_id", None)
@@ -1495,11 +1720,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
 
-            # вернёмся в админ-меню
             await handle_admin_menu(update, context, user_row)
             return
 
-    # 3) Кастомные даты для Платежей
+    # --- Кастомные даты для Платежей ---
     if "pay_custom_acc_id" in context.user_data:
         parts = text.split()
         if len(parts) != 2:
@@ -1518,17 +1742,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_payments_for_period(update, context, user_row, acc_id, from_ts, to_ts)
         return
 
-    # 4) Кастомные даты для Выписки (Excel)
+    # --- Кастомные даты для Выписки ---
     if context.user_data.get("stmt_waiting_dates"):
-        account_key = context.user_data.get("stmt_account_key")  # "all" или "<id>"
+        account_key = context.user_data.get("stmt_account_key")
 
         if account_key is None:
-            # мы не знаем, по какой карте делать выписку
             context.user_data["stmt_waiting_dates"] = False
             await update.message.reply_text("Сначала выберите карту для выписки.")
             return
 
-        text = update.message.text.strip()
         parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text(
@@ -1555,7 +1777,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 5) Обычное меню: кнопки 📥 Платежи / 📄 Выписка / 🛠 Администрирование
+    # --- Обычное меню ---
     if text == "📥 Платежи":
         await handle_payments_entry(update, context, user_row)
     elif text == "📄 Выписка":
@@ -1563,20 +1785,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🛠 Администрирование" and user_row["role"] == "admin":
         await handle_admin_menu(update, context, user_row)
     else:
-        # неизвестный текст — просто снова покажем меню
         await update.message.reply_text(
             "Выберите действие из меню:",
             reply_markup=build_main_menu(user_row["role"]),
         )
 
+
 # --- main() ---
+
 
 def main():
     logging.info("Starting bot.py ...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CallbackQueryHandler(approve_callback_handler, pattern=r"^approve:"))
+    app.add_handler(
+        CallbackQueryHandler(approve_callback_handler, pattern=r"^approve:")
+    )
 
     # Платежи
     app.add_handler(CallbackQueryHandler(pay_acc_callback, pattern=r"^pay_acc:"))
@@ -1586,10 +1811,33 @@ def main():
     app.add_handler(CallbackQueryHandler(stmt_acc_callback, pattern=r"^stmt_acc:"))
     app.add_handler(CallbackQueryHandler(stmt_period_callback, pattern=r"^stmt_per:"))
 
-    # ОДИН общий текстовый хендлер
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
+    # Админ-меню
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin:"))
+
+    # Управление счетами пользователя
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_user_accounts_menu,
+            pattern=rf"^{ADMIN_USER_ACCOUNTS_PREFIX}:\d+$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_user_accounts_add,
+            pattern=rf"^{ADMIN_USER_ACCOUNTS_ADD_PREFIX}:\d+(?::\d+)?$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_user_accounts_del,
+            pattern=rf"^{ADMIN_USER_ACCOUNTS_DEL_PREFIX}:\d+(?::\d+)?$",
+        )
+    )
+
+    # Общий текстовый хендлер
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
 
     app.run_polling()
 
