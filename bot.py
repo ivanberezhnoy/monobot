@@ -2,6 +2,11 @@
 
 import os
 from typing import List, Dict, Any
+import time
+from requests import HTTPError
+from telegram.ext import ContextTypes
+
+STATEMENT_MIN_INTERVAL = 60
 
 from telegram import (
     Update,
@@ -81,6 +86,33 @@ def get_available_accounts_for_user(user_row: Dict[str, Any]) -> List[Dict[str, 
         return list_all_active_accounts()
     return get_accounts_for_user(user_row["id"])
 
+def get_statement_wait_left(context: ContextTypes.DEFAULT_TYPE, token: str) -> int:
+    """
+    Возвращает, сколько секунд ещё нужно подождать перед следующей выпиской
+    по данному токену. 0 = можно вызывать сразу.
+    """
+    bot_data = context.application.bot_data
+    key = f"last_statement_call_ts:{token}"
+
+    last_ts = bot_data.get(key)
+    if last_ts is None:
+        return 0
+
+    now = time.time()
+    elapsed = now - last_ts
+    if elapsed >= STATEMENT_MIN_INTERVAL:
+        return 0
+
+    return int(STATEMENT_MIN_INTERVAL - elapsed)
+
+
+def mark_statement_call(context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
+    """
+    Отмечает, что по этому токену только что делали вызов выписки.
+    """
+    bot_data = context.application.bot_data
+    key = f"last_statement_call_ts:{token}"
+    bot_data[key] = time.time()
 
 # --- /start ---
 
@@ -797,26 +829,32 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await show_payments_for_period(query, context, user_row, acc_key, from_ts, to_ts)
 
 
-
-
-async def show_payments_for_period(source, context: ContextTypes.DEFAULT_TYPE,
-                                   user_row: Dict[str, Any],
-                                   account_key: str,
-                                   from_ts: int, to_ts: int):
+async def show_payments_for_period(
+    source,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_row: Dict[str, Any],
+    account_key: str,
+    from_ts: int,
+    to_ts: int,
+):
     """
     account_key: "all" или строковый id карты.
+    Показывает приходные операции по одной карте или по всем доступным картам.
     """
-    # Проверка лимита по дням
+
+    # --- Проверка лимита по дням ---
     if not user_has_unlimited_days(user_row):
         days = (to_ts - from_ts) / 86400.0
         if days > user_row["max_days"] + 1e-6:
-            await _reply(source,
-                         f"Выбранный период превышает допустимый лимит {user_row['max_days']} дней.")
+            await _reply(
+                source,
+                f"Выбранный период превышает допустимый лимит {user_row['max_days']} дней.",
+            )
             return
 
     ignore_ibans = get_ignore_ibans_norm()
 
-    # Определяем список карт, по которым собираем платежи
+    # --- Определяем список карт, по которым собираем платежи ---
     if account_key == "all":
         accounts = get_available_accounts_for_user(user_row)
     else:
@@ -830,17 +868,87 @@ async def show_payments_for_period(source, context: ContextTypes.DEFAULT_TYPE,
         await _reply(source, "Нет доступных карт.")
         return
 
+    # --- Собираем токены по всем вовлечённым организациям и проверяем лимит Monobank ---
+    org_cache: Dict[int, Dict[str, Any]] = {}
+    tokens: set[str] = set()
+
+    for acc in accounts:
+        org_id = acc.get("organization_id")
+        if org_id is None:
+            continue
+
+        org = org_cache.get(org_id)
+        if org is None:
+            org = get_organization_by_id(org_id)
+            org_cache[org_id] = org
+
+        if not org:
+            continue
+
+        token = org.get("token")
+        if not token:
+            continue
+
+        tokens.add(token)
+
+    if not tokens:
+        await _reply(
+            source,
+            "Для выбранных карт не найдено организаций с токенами Monobank.",
+        )
+        return
+
+    # Проверяем, не рано ли делать выписку (по всем токенам сразу)
+    max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
+    if max_wait_left > 0:
+        await _reply(
+            source,
+            "Monobank дозволяє отримувати виписку не частіше, ніж раз на хвилину.\n"
+            f"Спробуйте ще раз через {max_wait_left} с.",
+        )
+        return
+
+    # --- Основная логика формирования отчёта ---
     from datetime import datetime
 
     all_lines: list[str] = []
     total_ops = 0
 
     for acc in accounts:
-        org = get_organization_by_id(acc["organization_id"])
-        org_name = org["name"] if org else "?"
+        org_id = acc.get("organization_id")
+        org = org_cache.get(org_id)
+        if not org:
+            continue
+
+        org_name = org.get("name") or "?"
+        token = org.get("token")
+        if not token:
+            continue
+
         card_label = f"{org_name} – {acc['name']}"
 
-        items = fetch_statement(org["token"], acc["mono_account_id"], from_ts, to_ts)
+        try:
+            # Делаем запрос к API Monobank
+            items = fetch_statement(token, acc["mono_account_id"], from_ts, to_ts)
+            # Отмечаем успешный вызов (теперь по этому токену будет лимит по времени)
+            mark_statement_call(context, token)
+        except HTTPError as e:
+            # Подстраховка: если Monobank всё-таки вернул 429,
+            # аккуратно сообщаем пользователю и выходим, не падая.
+            if e.response is not None and e.response.status_code == 429:
+                wait_left = get_statement_wait_left(context, token)
+                msg = (
+                    "Monobank просить не робити виписку частіше, ніж раз на хвилину.\n"
+                )
+                if wait_left > 0:
+                    msg += f"Спробуйте ще раз через приблизно {wait_left} с."
+                else:
+                    msg += "Спробуйте ще раз трохи пізніше."
+                await _reply(source, msg)
+                return
+            # остальные ошибки пусть всплывают, чтобы ты их увидел в логах
+            raise
+
         items = filter_income_and_ignore(items, ignore_ibans)
 
         if not items:
@@ -870,8 +978,6 @@ async def show_payments_for_period(source, context: ContextTypes.DEFAULT_TYPE,
 
     text = "\n".join(all_lines)
     await _reply(source, text)
-
-
 
 async def _reply(source, text: str):
     if hasattr(source, "message") and source.message:
@@ -1046,7 +1152,7 @@ async def generate_and_send_statement(
     from_raw: str,
     to_raw: str,
 ):
-    # проверка лимита дней
+    # --- проверка лимита дней ---
     if not user_has_unlimited_days(user_row):
         days = (to_ts - from_ts) / 86400.0
         if days > user_row["max_days"] + 1e-6:
@@ -1058,7 +1164,7 @@ async def generate_and_send_statement(
 
     ignore_ibans = get_ignore_ibans_norm()
 
-    # формируем список карт
+    # --- формируем список карт ---
     if account_key == "all":
         accounts = get_available_accounts_for_user(user_row)
     else:
@@ -1076,12 +1182,76 @@ async def generate_and_send_statement(
 
     rows: List[Dict[str, Any]] = []
 
+    # --- собираем организации и токены, сразу учитывая is_active ---
+    org_cache: Dict[int, Dict[str, Any]] = {}
+    tokens: set[str] = set()
+
     for acc in accounts:
-        org = get_organization_by_id(acc["organization_id"])
-        if not org or not org["is_active"]:
+        org_id = acc.get("organization_id")
+        if org_id is None:
             continue
 
-        items = fetch_statement(org["token"], acc["mono_account_id"], from_ts, to_ts)
+        org = org_cache.get(org_id)
+        if org is None:
+            org = get_organization_by_id(org_id)
+            org_cache[org_id] = org
+
+        if not org or not org.get("is_active"):
+            continue
+
+        token = org.get("token")
+        if not token:
+            continue
+
+        tokens.add(token)
+
+    if not tokens:
+        await _reply(
+            source,
+            "Для выбранных карт не найдено активных организаций с токенами Monobank.",
+        )
+        return
+
+    # --- проверяем лимит Monobank по всем токенам сразу ---
+    max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
+    if max_wait_left > 0:
+        await _reply(
+            source,
+            "Monobank дозволяє отримувати виписку не частіше, ніж раз на хвилину.\n"
+            f"Спробуйте ще раз через {max_wait_left} с.",
+        )
+        return
+
+    # --- основной цикл по аккаунтам ---
+    for acc in accounts:
+        org_id = acc.get("organization_id")
+        org = org_cache.get(org_id)
+        if not org or not org.get("is_active"):
+            continue
+
+        token = org.get("token")
+        if not token:
+            continue
+
+        try:
+            # запрос к API Monobank
+            items = fetch_statement(token, acc["mono_account_id"], from_ts, to_ts)
+            # фиксируем успешный вызов для этого токена
+            mark_statement_call(context, token)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                # Monobank всё-таки сказал "Too Many Requests"
+                wait_left = get_statement_wait_left(context, token)
+                msg = "Monobank просить не робити виписку частіше, ніж раз на хвилину.\n"
+                if wait_left > 0:
+                    msg += f"Спробуйте ще раз через приблизно {wait_left} с."
+                else:
+                    msg += "Спробуйте ще раз трохи пізніше."
+                await _reply(source, msg)
+                return
+            # остальные ошибки пусть полетят наверх (увидишь в логах)
+            raise
+
         items = filter_income_and_ignore(items, ignore_ibans)
 
         for it in sorted(items, key=lambda x: int(x.get("time", 0))):
@@ -1106,7 +1276,7 @@ async def generate_and_send_statement(
         await _reply(source, "Нет приходных операций за выбранный период.")
         return
 
-    # сортировка и формирование XLSX — как у тебя уже было
+    # --- сортировка и формирование XLSX ---
     rows.sort(key=lambda r: (r["_token_id"], r["_account_id"], r["datetime"]))
 
     filename = f"выписка_{from_raw}_{to_raw}.xlsx"
@@ -1125,6 +1295,7 @@ async def generate_and_send_statement(
         filename=filename,
         caption=f"Выписка за период {from_raw} — {to_raw}",
     )
+
 
 
 async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
