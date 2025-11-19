@@ -149,7 +149,6 @@ async def _reply(source, text: str):
         await source.message.reply_text(text)
         return
 
-    # если совсем непонятно, можно ничего не делать или залогировать
     logging.warning("Unsupported source passed to _reply: %r", type(source))
 
 
@@ -257,9 +256,6 @@ async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT
         return
 
     user_accounts = get_accounts_for_user(user_id)  # счета, доступные этому юзеру
-    all_accounts = list_all_active_accounts()  # все активные счета
-
-    user_acc_ids = {acc["id"] for acc in user_accounts}
 
     lines: list[str] = [f"Пользователь: {user['full_name']}", "", "Доступные счета:"]
 
@@ -644,7 +640,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # --- дальше нужны ID ---
-    if action in ("acc_org", "acc_add", "acc_list", "acc_info", "user"):
+    if action in ("acc_org", "acc_add", "acc_list", "acc_info", "user", "user_roles"):
         if len(parts) < 3:
             await query.edit_message_text(
                 "Некорректные данные admin callback (ожидается ID)."
@@ -787,26 +783,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"Username: {uname}\n"
             f"Роль: `{role}`\n"
             f"MaxDays: {max_days}\n\n"
-            "Выберите новую роль или управляйте доступом к счетам:"
+            "Выберите действие:"
         )
 
         kb = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        "👤 Pending", callback_data=f"admin:userrole:pending:{u['id']}"
-                    ),
-                    InlineKeyboardButton(
-                        "👔 Менеджер", callback_data=f"admin:userrole:manager:{u['id']}"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📊 Бухгалтер",
-                        callback_data=f"admin:userrole:accountant:{u['id']}",
-                    ),
-                    InlineKeyboardButton(
-                        "👑 Админ", callback_data=f"admin:userrole:admin:{u['id']}"
+                        "👤 Изменить роль",
+                        callback_data=f"admin:user_roles:{u['id']}",
                     ),
                 ],
                 [
@@ -817,11 +802,76 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 ],
                 [
                     InlineKeyboardButton(
-                        "⛔ Blocked", callback_data=f"admin:userrole:blocked:{u['id']}"
+                        "⬅️ Назад к списку",
+                        callback_data="admin:users",
                     ),
                 ],
             ]
         )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # --- Подменю: список ролей пользователя ---
+    if action == "user_roles":
+        u = get_user(obj_id)
+        if not u:
+            await query.edit_message_text("Пользователь не найден.")
+            return
+
+        current_role = u["role"]
+        uname = f"@{u['username']}" if u["username"] else "(нет username)"
+        text = (
+            f"👤 Изменить роль\n\n"
+            f"Пользователь: *{u['full_name'] or ''}*\n"
+            f"ID: `{u['id']}`\n"
+            f"Username: {uname}\n"
+            f"Текущая роль: `{current_role}`\n\n"
+            "Выберите новую роль:"
+        )
+
+        def role_button(label: str, role_code: str) -> InlineKeyboardButton:
+            return InlineKeyboardButton(
+                label,
+                callback_data=f"admin:userrole:{role_code}:{u['id']}",
+            )
+
+        # pending НЕ показываем, текущую роль НЕ показываем
+        role_options = [
+            ("👔 Менеджер", "manager"),
+            ("📊 Бухгалтер", "accountant"),
+            ("👑 Админ", "admin"),
+            ("⛔ Blocked", "blocked"),
+        ]
+
+        rows: list[list[InlineKeyboardButton]] = []
+        current_row: list[InlineKeyboardButton] = []
+
+        for label, code in role_options:
+            if code == current_role:
+                continue  # не показываем текущую роль
+            current_row.append(role_button(label, code))
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+
+        if current_row:
+            rows.append(current_row)
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"admin:user:{u['id']}",
+                )
+            ]
+        )
+
+        kb = InlineKeyboardMarkup(rows)
 
         await query.edit_message_text(
             text,
@@ -843,13 +893,19 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Некорректный ID пользователя.")
             return
 
+        # pending нельзя назначать вручную из меню
+        if new_role == "pending":
+            await query.edit_message_text(
+                "Роль 'pending' назначается только автоматически и не может быть выбрана вручную."
+            )
+            return
+
         if new_role == "manager":
             max_days = 7
         elif new_role in ("accountant", "admin"):
             max_days = 0
-        elif new_role == "pending":
-            max_days = 3
         else:
+            # blocked и любые другие
             max_days = 0
 
         update_user_role(target_id, new_role, max_days=max_days)
@@ -1532,10 +1588,6 @@ async def generate_and_send_statement(
     elif hasattr(source, "message") and source.message:
         chat_id = source.message.chat_id
     else:
-        # fallback
-        chat_id = None
-
-    if chat_id is None:
         logging.warning("Cannot determine chat_id for sending statement file")
         return
 
