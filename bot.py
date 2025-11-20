@@ -1400,6 +1400,10 @@ async def ask_period_for_payments(
                     "⏱ Последний час",
                     callback_data=f"pay_per:{account_key}:last_hour",
                 ),
+                InlineKeyboardButton(
+                    "⏱ Последние 3 часа",
+                    callback_data=f"pay_per:{account_key}:last_3_hours",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1462,6 +1466,11 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if mode == "last_hour":
         from_ts = int((now - timedelta(hours=1)).timestamp())
+        to_ts = int(now.timestamp())
+        await show_payments_for_period(query, context, user_row, acc_key, from_ts, to_ts)
+        return
+    if mode == "last_3_hours":
+        from_ts = int((now - timedelta(hours=3)).timestamp())
         to_ts = int(now.timestamp())
         await show_payments_for_period(query, context, user_row, acc_key, from_ts, to_ts)
         return
