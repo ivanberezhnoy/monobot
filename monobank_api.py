@@ -1,6 +1,6 @@
 # monobank_api.py
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 import time
 import requests
 from datetime import datetime
@@ -59,28 +59,42 @@ def fetch_statement(token: str, account_id: str, from_ts: int, to_ts: int) -> Li
 def filter_income_and_ignore(
     items: List[Dict[str, Any]],
     ignore_ibans_norm: set[str],
-) -> List[Dict[str, Any]]:
+    allow_in: bool = True,
+    allow_out: bool = False,
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
     """
-    Оставляем только приходные операции (amount > 0) и
-    отбрасываем те, у которых counterIban входит в ignore_ibans_norm.
+    Фильтрация операций по разрешённым направлениям и списку IBAN-исключений.
+    Возвращает отфильтрованный список и множество фактически включённых типов потоков
+    (subset of {"in", "out"}).
     """
     result: List[Dict[str, Any]] = []
+    flows: Set[str] = set()
+
     for it in items:
         try:
             amount = int(it.get("amount", 0))
         except Exception:
             continue
 
-        if amount <= 0:
+        if amount == 0:
             continue
 
         counter_iban = (it.get("counterIban") or "").lower()
         if counter_iban and counter_iban in ignore_ibans_norm:
             continue
 
-        result.append(it)
+        if amount > 0:
+            if not allow_in:
+                continue
+            flows.add("in")
+            result.append(it)
+        else:
+            if not allow_out:
+                continue
+            flows.add("out")
+            result.append(it)
 
-    return result
+    return result, flows
 
 
 def unix_from_str(value: str, is_to: bool = False) -> int:

@@ -8,6 +8,31 @@ import pymysql.cursors
 from config import DB_CONFIG
 
 
+def normalize_permissions_value(value: Optional[str]) -> str:
+    """
+    Normalizes user_account permissions to one of:
+    - "in"
+    - "out"
+    - "in,out"  (both, order enforced)
+    Falls back to "in" if value doesn't contain valid tokens.
+    """
+    if not value:
+        return "in"
+
+    tokens = {chunk.strip().lower() for chunk in value.split(",") if chunk.strip()}
+    valid = []
+    for key in ("in", "out"):
+        if key in tokens:
+            valid.append(key)
+
+    if not valid:
+        valid = ["in"]
+
+    if len(valid) == 2:
+        return "in,out"
+    return valid[0]
+
+
 @contextmanager
 def get_connection():
     """
@@ -178,7 +203,7 @@ def get_accounts_for_user(user_id: int) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT a.*
+                SELECT a.*, ua.permissions
                 FROM accounts a
                 JOIN user_accounts ua ON ua.account_id = a.id
                 WHERE ua.user_id = %s
@@ -266,10 +291,10 @@ def grant_account_to_user(user_id: int, account_id: int) -> None:
             # MySQL-specific: INSERT IGNORE will do nothing if row already exists
             cur.execute(
                 """
-                INSERT IGNORE INTO user_accounts (user_id, account_id)
-                VALUES (%s, %s)
+                INSERT IGNORE INTO user_accounts (user_id, account_id, permissions)
+                VALUES (%s, %s, %s)
                 """,
-                (user_id, account_id),
+                (user_id, account_id, "in"),
             )
         conn.commit()
 
@@ -289,6 +314,47 @@ def revoke_account_from_user(user_id: int, account_id: int) -> None:
                 (user_id, account_id),
             )
         conn.commit()
+
+
+def get_user_account_permissions_map(user_id: int) -> Dict[int, str]:
+    """
+    Returns mapping account_id -> permissions string for the given user.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT account_id, permissions
+                FROM user_accounts
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            return {
+                row["account_id"]: normalize_permissions_value(row.get("permissions"))
+                for row in rows
+            }
+
+
+def update_user_account_permissions(user_id: int, account_id: int, permissions: str) -> bool:
+    """
+    Updates permissions for a particular (user, account) pair.
+    Returns True if a row was updated.
+    """
+    normalized = normalize_permissions_value(permissions)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE user_accounts
+                SET permissions = %s
+                WHERE user_id = %s AND account_id = %s
+                """,
+                (normalized, user_id, account_id),
+            )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 # --- Organizations ---

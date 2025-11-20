@@ -43,6 +43,8 @@ from db import (
     list_users,
     grant_account_to_user,
     revoke_account_from_user,
+    get_user_account_permissions_map,
+    update_user_account_permissions,
 )
 from monobank_api import (
     unix_from_str,
@@ -71,6 +73,61 @@ def build_main_menu(role: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
+def _flows_from_permissions(value: str | None, *, ensure_income: bool = False) -> set[str]:
+    """
+    Преобразует строку разрешений в множество ("in", "out").
+    ensure_income=True гарантирует присутствие "in" в результате.
+    """
+    if not value:
+        flows: set[str] = set()
+    else:
+        tokens = {chunk.strip().lower() for chunk in value.split(",") if chunk.strip()}
+        if "full" in tokens:
+            flows = {"in", "out"}
+        else:
+            flows = {token for token in tokens if token in {"in", "out"}}
+    if not flows:
+        flows = {"in"}
+    if ensure_income:
+        flows.add("in")
+    return flows
+
+
+def _permissions_string_from_flows(flows: set[str]) -> str:
+    flows = set(flows)
+    if "in" in flows and "out" in flows:
+        return "in,out"
+    if "out" in flows and "in" not in flows:
+        return "out"
+    return "in"
+
+
+def _flows_to_payments_label(flows: set[str]) -> str:
+    flows = flows or {"in"}
+    if "in" in flows and "out" in flows:
+        return "входящие и исходящие платежи"
+    if "out" in flows and "in" not in flows:
+        return "исходящие платежи"
+    return "входящие платежи"
+
+
+def _flows_to_short_label(flows: set[str]) -> str:
+    flows = flows or {"in"}
+    if "in" in flows and "out" in flows:
+        return "Все"
+    if "out" in flows and "in" not in flows:
+        return "Исходящие"
+    return "Входящие"
+
+
+def _attach_access_metadata(account: Dict[str, Any], flows: set[str]) -> Dict[str, Any]:
+    acc = dict(account)
+    acc_flows = set(flows) or {"in"}
+    acc["access_flows"] = acc_flows
+    acc["permissions"] = _permissions_string_from_flows(acc_flows)
+    return acc
+
+
 def user_allowed_for_menu(user_row: Dict[str, Any]) -> bool:
     return user_row["role"] in ("manager", "accountant", "admin")
 
@@ -83,12 +140,30 @@ def user_has_unlimited_days(user_row: Dict[str, Any]) -> bool:
 
 def get_available_accounts_for_user(user_row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Для admin/accountant: возвращаем все активные счета.
-    Для остальных: только те, что есть в user_accounts.
+    Для admin: все активные счета (всегда с входящими, исходящие только если заданы).
+    Для остальных (включая бухгалтера): только явно выданные счета.
     """
-    if user_row["role"] in ("admin", "accountant"):
-        return list_all_active_accounts()
-    return get_accounts_for_user(user_row["id"])
+    role = user_row["role"]
+    user_id = user_row["id"]
+
+    if role == "admin":
+        perm_map = get_user_account_permissions_map(user_id)
+        accounts = list_all_active_accounts()
+        result = []
+        for acc in accounts:
+            flows = _flows_from_permissions(
+                perm_map.get(acc["id"]),
+                ensure_income=True,
+            )
+            result.append(_attach_access_metadata(acc, flows))
+        return result
+
+    accounts = get_accounts_for_user(user_id)
+    result = []
+    for acc in accounts:
+        flows = _flows_from_permissions(acc.get("permissions"))
+        result.append(_attach_access_metadata(acc, flows))
+    return result
 
 
 def get_statement_wait_left(context: ContextTypes.DEFAULT_TYPE, token: str) -> int:
@@ -240,6 +315,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ADMIN_USER_ACCOUNTS_PREFIX = "admin_user_accounts"  # открыть меню счетов пользователя
 ADMIN_USER_ACCOUNTS_ADD_PREFIX = "admin_user_accounts_add"  # выбор счета для добавления
 ADMIN_USER_ACCOUNTS_DEL_PREFIX = "admin_user_accounts_del"  # выбор счета для удаления
+ADMIN_USER_ACCOUNTS_PERM_PREFIX = (
+    "admin_user_accounts_perm"  # настройки уровня доступа
+)
 
 
 async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,7 +343,10 @@ async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT
         for acc in user_accounts:
             org = get_organization_by_id(acc["organization_id"])
             org_name = org["name"] if org else "?"
-            lines.append(f"  • {org_name} – {acc['name']}")
+            perm_label = _flows_to_short_label(
+                _flows_from_permissions(acc.get("permissions"))
+            )
+            lines.append(f"  • {org_name} – {acc['name']} (уровень: {perm_label})")
 
     text = "\n".join(lines)
 
@@ -280,6 +361,12 @@ async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT
             InlineKeyboardButton(
                 "➖ Удалить счёт",
                 callback_data=f"{ADMIN_USER_ACCOUNTS_DEL_PREFIX}:{user_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⚙️ Уровень доступа",
+                callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}",
             ),
         ],
         [
@@ -455,6 +542,145 @@ async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Счёт удалён у пользователя.", reply_markup=keyboard)
 
 
+async def admin_user_accounts_perm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) < 2:
+        await query.edit_message_text("Некорректный запрос.")
+        return
+
+    user_id = int(parts[1])
+    user = get_user(user_id)
+    if not user:
+        await query.edit_message_text("Пользователь не найден.")
+        return
+
+    if len(parts) == 2:
+        user_accounts = get_accounts_for_user(user_id)
+        if not user_accounts:
+            await query.edit_message_text(
+                "У пользователя нет привязанных счетов.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        keyboard_rows = []
+        for acc in user_accounts:
+            org = get_organization_by_id(acc["organization_id"])
+            org_name = org["name"] if org else "?"
+            perm_label = _flows_to_short_label(
+                _flows_from_permissions(acc.get("permissions"))
+            )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{org_name} – {acc['name']} ({perm_label})",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{acc['id']}",
+                    )
+                ]
+            )
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}"
+                )
+            ]
+        )
+
+        await query.edit_message_text(
+            "Выберите счёт для изменения уровня доступа:",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+        return
+
+    if len(parts) == 3:
+        account_id = int(parts[2])
+        acc = get_account_by_id(account_id)
+        if not acc:
+            await query.edit_message_text("Счёт не найден.")
+            return
+        org = get_organization_by_id(acc["organization_id"])
+        org_name = org["name"] if org else "?"
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Входящие платежи",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:in",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Исходящие платежи",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:out",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Все",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:all",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}",
+                    )
+                ],
+            ]
+        )
+
+        await query.edit_message_text(
+            f"Счёт: {org_name} – {acc['name']}\nВыберите уровень доступа:",
+            reply_markup=keyboard,
+        )
+        return
+
+    # len >= 4 => финальный выбор
+    account_id = int(parts[2])
+    choice = parts[3]
+    mapping = {"in": "in", "out": "out", "all": "in,out"}
+    target = mapping.get(choice)
+    if not target:
+        await query.edit_message_text("Некорректный уровень доступа.")
+        return
+
+    success = update_user_account_permissions(user_id, account_id, target)
+    if not success:
+        await query.edit_message_text(
+            "Не удалось обновить уровень доступа (возможно, счёт уже удалён)."
+        )
+        return
+
+    flows = _flows_from_permissions(target)
+    label = _flows_to_short_label(flows)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}",
+                )
+            ]
+        ]
+    )
+    await query.edit_message_text(
+        f"Уровень доступа обновлён: {label}.",
+        reply_markup=keyboard,
+    )
 # --- approve от админа ---
 
 
@@ -1031,9 +1257,15 @@ async def ask_period_for_payments(
     if account_key == "all":
         card_label = "Все доступные карты"
     else:
-        acc = get_account_by_id(int(account_key))
+        try:
+            acc_id = int(account_key)
+        except ValueError:
+            await _reply(source, "Некорректный идентификатор карты.")
+            return
+        available = get_available_accounts_for_user(user_row)
+        acc = next((a for a in available if a["id"] == acc_id), None)
         if not acc:
-            await _reply(source, "Карта не найдена.")
+            await _reply(source, "Карта не найдена или недоступна.")
             return
         org = get_organization_by_id(acc["organization_id"])
         org_name = org["name"] if org else "?"
@@ -1160,15 +1392,16 @@ async def show_payments_for_period(
 
     ignore_ibans = get_ignore_ibans_norm()
 
-    # --- Список карт ---
+    available_accounts = get_available_accounts_for_user(user_row)
     if account_key == "all":
-        accounts = get_available_accounts_for_user(user_row)
+        accounts = available_accounts
     else:
-        acc = get_account_by_id(int(account_key))
-        if not acc:
-            await _reply(source, "Карта не найдена.")
+        try:
+            acc_id = int(account_key)
+        except ValueError:
+            await _reply(source, "Некорректный идентификатор карты.")
             return
-        accounts = [acc]
+        accounts = [acc for acc in available_accounts if acc["id"] == acc_id]
 
     if not accounts:
         await _reply(source, "Нет доступных карт.")
@@ -1220,6 +1453,9 @@ async def show_payments_for_period(
         return
 
     # --- Основной цикл по аккаунтам ---
+    prev_org_id: int | None = None
+    first_block = True
+
     for acc in accounts:
         org_id = acc.get("organization_id")
         org = org_cache.get(org_id)
@@ -1232,6 +1468,9 @@ async def show_payments_for_period(
 
         org_name = org.get("name") or "?"
         card_label = f"{org_name} – {acc['name']}"
+        flows_allowed = acc.get("access_flows") or {"in"}
+        allow_in = "in" in flows_allowed
+        allow_out = "out" in flows_allowed
 
         try:
             items = fetch_statement(token, acc["mono_account_id"], from_ts, to_ts)
@@ -1248,30 +1487,44 @@ async def show_payments_for_period(
                 return
             raise
 
-        items = filter_income_and_ignore(items, ignore_ibans)
+        filtered_items, included_flows = filter_income_and_ignore(
+            items,
+            ignore_ibans,
+            allow_in=allow_in,
+            allow_out=allow_out,
+        )
 
-        if not items:
+        if not filtered_items:
             continue
 
-        if account_key == "all":
-            all_lines.append(f"💳 {card_label} — приходные операции:")
+        if not first_block:
+            if prev_org_id != org_id:
+                all_lines.append("")
+                all_lines.append("")
+            else:
+                all_lines.append("")
+        first_block = False
+        prev_org_id = org_id
 
-        for it in sorted(items, key=lambda x: int(x.get("time", 0))):
+        header_label = _flows_to_payments_label(included_flows)
+        all_lines.append(f"💳 {card_label} — {header_label}")
+
+        for it in sorted(filtered_items, key=lambda x: int(x.get("time", 0))):
             t = int(it.get("time", 0))
             dt_str = datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
             amount = int(it.get("amount", 0)) / 100.0
+            flow = "out" if amount < 0 else "in"
+            prefix = "🔴 -" if flow == "out" else "🟢 +"
+            formatted_amount = f"{prefix}{abs(amount):.2f} UAH"
             comment = it.get("comment") or it.get("description") or ""
-            line = f"{dt_str} — {amount:.2f} UAH"
+            line = f"{dt_str} — {formatted_amount}"
             all_lines.append(line)
             if comment:
                 all_lines.append(f"  {comment}")
             total_ops += 1
 
-        if account_key == "all":
-            all_lines.append("")
-
     if total_ops == 0:
-        await _reply(source, "Нет приходных операций за выбранный период.")
+        await _reply(source, "Нет платежей за выбранный период.")
         return
 
     text = "\n".join(all_lines)
@@ -1381,12 +1634,19 @@ async def stmt_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["stmt_account_key"] = acc_key
 
+    available_accounts = get_available_accounts_for_user(user_row)
+
     if acc_key == "all":
         account = None
     else:
-        account = get_account_by_id(int(acc_key))
+        try:
+            acc_id = int(acc_key)
+        except ValueError:
+            await query.edit_message_text("Некорректный идентификатор карты.")
+            return
+        account = next((a for a in available_accounts if a["id"] == acc_id), None)
         if not account:
-            await query.edit_message_text("Карта не найдена.")
+            await query.edit_message_text("Карта не найдена или недоступна.")
             return
 
     await ask_statement_period(query, context, account)
@@ -1472,15 +1732,16 @@ async def generate_and_send_statement(
 
     ignore_ibans = get_ignore_ibans_norm()
 
-    # --- формируем список карт ---
+    available_accounts = get_available_accounts_for_user(user_row)
     if account_key == "all":
-        accounts = get_available_accounts_for_user(user_row)
+        accounts = available_accounts
     else:
-        acc = get_account_by_id(int(account_key))
-        if not acc:
-            await _reply(source, "Карта не найдена.")
+        try:
+            acc_id = int(account_key)
+        except ValueError:
+            await _reply(source, "Некорректный идентификатор карты.")
             return
-        accounts = [acc]
+        accounts = [acc for acc in available_accounts if acc["id"] == acc_id]
 
     if not accounts:
         await _reply(source, "Нет доступных карт для выписки.")
@@ -1553,12 +1814,27 @@ async def generate_and_send_statement(
                 return
             raise
 
-        items = filter_income_and_ignore(items, ignore_ibans)
+        flows_allowed = acc.get("access_flows") or {"in"}
+        allow_in = "in" in flows_allowed
+        allow_out = "out" in flows_allowed
 
-        for it in sorted(items, key=lambda x: int(x.get("time", 0))):
+        filtered_items, included_flows = filter_income_and_ignore(
+            items,
+            ignore_ibans,
+            allow_in=allow_in,
+            allow_out=allow_out,
+        )
+
+        if not filtered_items:
+            continue
+
+        flow_label = _flows_to_payments_label(included_flows)
+
+        for it in sorted(filtered_items, key=lambda x: int(x.get("time", 0))):
             t = int(it.get("time", 0))
             dt_str = datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
             amount = int(it.get("amount", 0)) / 100.0
+            flow = "out" if amount < 0 else "in"
             comment = it.get("comment") or it.get("description") or ""
 
             rows.append(
@@ -1570,11 +1846,13 @@ async def generate_and_send_statement(
                     "datetime": dt_str,
                     "amount": amount,
                     "comment": comment,
+                    "flow": flow,
+                    "account_flow_label": flow_label,
                 }
             )
 
     if not rows:
-        await _reply(source, "Нет приходных операций за выбранный период.")
+        await _reply(source, "Нет платежей за выбранный период.")
         return
 
     rows.sort(key=lambda r: (r["_token_id"], r["_account_id"], r["datetime"]))
@@ -1883,6 +2161,12 @@ def main():
         CallbackQueryHandler(
             admin_user_accounts_del,
             pattern=rf"^{ADMIN_USER_ACCOUNTS_DEL_PREFIX}:\d+(?::\d+)?$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_user_accounts_perm,
+            pattern=rf"^{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:\d+(?::\d+){0,2}(?::(?:in|out|all))?$",
         )
     )
 
