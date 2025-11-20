@@ -81,8 +81,8 @@ def upsert_user_on_start(user_id: int, full_name: str, username: str) -> Dict[st
             else:
                 cur.execute(
                     """
-                    INSERT INTO users (id, full_name, username, role, max_days)
-                    VALUES (%s, %s, %s, 'pending', 3)
+                    INSERT INTO users (id, full_name, username, role, max_days, friendly_name)
+                    VALUES (%s, %s, %s, 'pending', 3, NULL)
                     """,
                     (user_id, full_name, username),
                 )
@@ -136,6 +136,19 @@ def update_user_role(user_id: int, role: str, max_days: Optional[int] = None) ->
         conn.commit()
 
 
+def update_user_friendly_name(user_id: int, friendly_name: Optional[str]) -> None:
+    """
+    Updates friendly (admin-facing) name for the user.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET friendly_name=%s WHERE id=%s",
+                (friendly_name, user_id),
+            )
+        conn.commit()
+
+
 def list_users() -> List[Dict[str, Any]]:
     """
     Returns all users for admin UI.
@@ -156,7 +169,7 @@ def list_users() -> List[Dict[str, Any]]:
                         WHEN 'blocked' THEN 4
                         ELSE 5
                     END,
-                    full_name
+                    COALESCE(friendly_name, full_name, username, CAST(id AS CHAR))
                 """
             )
             return cur.fetchall()

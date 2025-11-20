@@ -49,6 +49,7 @@ from db import (
     revoke_account_from_user,
     get_user_account_permissions_map,
     update_user_account_permissions,
+    update_user_friendly_name,
 )
 from monobank_api import (
     unix_from_str,
@@ -139,6 +140,15 @@ def _attach_access_metadata(account: Dict[str, Any], flows: set[str]) -> Dict[st
     acc["access_flows"] = acc_flows
     acc["permissions"] = _permissions_string_from_flows(acc_flows)
     return acc
+
+
+def _user_display_name(user_row: Dict[str, Any]) -> str:
+    return (
+        (user_row.get("friendly_name") or "").strip()
+        or (user_row.get("full_name") or "").strip()
+        or (user_row.get("username") or "").strip()
+        or str(user_row.get("id", "пользователь"))
+    )
 
 
 def _parse_iso_date(token: str) -> date | None:
@@ -334,16 +344,18 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username=tg_user.username or "",
     )
 
+    display_name = _user_display_name(row)
+
     if row["role"] == "admin":
         await update.message.reply_text(
-            "Привет, администратор 👋",
+            f"Привет, {display_name} 👋",
             reply_markup=build_main_menu("admin"),
         )
         return
 
     if row["role"] in ("manager", "accountant"):
         await update.message.reply_text(
-            "Добро пожаловать! Вы авторизованы ✅",
+            f"Добро пожаловать, {display_name}! Вы авторизованы ✅",
             reply_markup=build_main_menu(row["role"]),
         )
         return
@@ -429,7 +441,11 @@ async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT
 
     user_accounts = get_accounts_for_user(user_id)  # счета, доступные этому юзеру
 
-    lines: list[str] = [f"Пользователь: {user['full_name']}", "", "Доступные счета:"]
+    lines: list[str] = [
+        f"Пользователь: {_user_display_name(user)}",
+        "",
+        "Доступные счета:",
+    ]
 
     if not user_accounts:
         lines.append("  — нет ни одного счета")
@@ -800,14 +816,27 @@ async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("⛔ Только администратор может одобрять пользователей.")
         return
 
-    # Определяем max_days по роли
-    if role == "manager":
-        max_days = 7
-    elif role in ("accountant", "admin"):
-        max_days = 0
-    elif role == "pending":
+    if role in ("manager", "accountant", "admin"):
+        if role == "manager":
+            suggested = 7
+        else:
+            suggested = 0
+        context.user_data["admin_mode"] = "approve_set_friendly_name"
+        context.user_data["pending_user_setup"] = {
+            "target_id": uid,
+            "role": role,
+            "suggested_max_days": suggested,
+        }
+        await query.edit_message_text(
+            "Введите friendly name (понятное имя) для нового пользователя:",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Для остальных ролей (blocked/pending) оставляем старую логику
+    if role == "pending":
         max_days = 3
-    else:  # blocked и прочие
+    else:
         max_days = 0
 
     update_user_role(uid, role, max_days=max_days)
@@ -818,11 +847,10 @@ async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT
         uname = f"@{u['username']}"
 
     await query.edit_message_text(
-        f"✅ Роль пользователя {uid} {uname} установлена: `{role}`",
+        f"✅ Роль пользователя {uid} {uname} установлена: `{role}`.",
         parse_mode="Markdown",
     )
 
-    # Пытаемся уведомить самого пользователя
     try:
         from telegram import ReplyKeyboardRemove
 
@@ -833,26 +861,9 @@ async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 text=txt,
                 reply_markup=ReplyKeyboardRemove(),
             )
-        elif role in ("manager", "accountant", "admin"):
-            txt = "✅ Вам предоставлен доступ к боту."
-            await context.bot.send_message(
-                chat_id=uid,
-                text=txt,
-                reply_markup=build_main_menu(role),
-            )
         elif role == "pending":
             txt = "Ваш статус в боте: pending. Ожидайте решения администратора."
-            await context.bot.send_message(
-                chat_id=uid,
-                text=txt,
-            )
-        else:
-            txt = f"Ваша роль в боте изменена на: {role}."
-            await context.bot.send_message(
-                chat_id=uid,
-                text=txt,
-            )
-
+            await context.bot.send_message(chat_id=uid, text=txt)
     except Exception:
         pass
 
@@ -939,9 +950,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 role_icon = "❓"
 
-            name = u["full_name"] or ""
-            uname = f"@{u['username']}" if u["username"] else ""
-            label = f"{role_icon} {u['id']} – {name} {uname}".strip()
+            display_name = _user_display_name(u)
+            uname = f" (@{u['username']})" if u.get("username") else ""
+            label = f"{role_icon} {display_name}{uname} – ID {u['id']}"
 
             keyboard.append(
                 [
@@ -968,6 +979,8 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         "acc_info",
         "user",
         "user_roles",
+        "user_fname",
+        "user_maxdays",
     ):
         if len(parts) < 3:
             await query.edit_message_text(
@@ -1218,10 +1231,12 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         max_days = u["max_days"]
 
         uname = f"@{u['username']}" if u["username"] else "(нет username)"
+        friendly = u.get("friendly_name") or "—"
         text = (
-            f"👤 Пользователь: *{u['full_name'] or ''}*\n"
+            f"👤 Пользователь: *{_user_display_name(u)}*\n"
             f"ID: `{u['id']}`\n"
             f"Username: {uname}\n"
+            f"Friendly name: {friendly}\n"
             f"Роль: `{role}`\n"
             f"MaxDays: {max_days}\n\n"
             "Выберите действие:"
@@ -1243,6 +1258,18 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 ],
                 [
                     InlineKeyboardButton(
+                        "✏️ Friendly name",
+                        callback_data=f"admin:user_fname:{u['id']}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📆 Max days",
+                        callback_data=f"admin:user_maxdays:{u['id']}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         "⬅️ Назад к списку",
                         callback_data="admin:users",
                     ),
@@ -1258,6 +1285,33 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # --- Подменю: список ролей пользователя ---
+    
+    if action == "user_fname":
+        u = get_user(obj_id)
+        if not u:
+            await query.edit_message_text("Пользователь не найден.")
+            return
+        context.user_data["admin_mode"] = "edit_user_friendly_name"
+        context.user_data["edit_user_target_id"] = obj_id
+        await query.edit_message_text(
+            f"Введите новое friendly name для пользователя {_user_display_name(u)}:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "user_maxdays":
+        u = get_user(obj_id)
+        if not u:
+            await query.edit_message_text("Пользователь не найден.")
+            return
+        context.user_data["admin_mode"] = "edit_user_max_days"
+        context.user_data["edit_user_target_id"] = obj_id
+        await query.edit_message_text(
+            f"Введите новое значение `max_days` для {_user_display_name(u)} "
+            "(целое число, 0 = без ограничений):",
+            parse_mode="Markdown",
+        )
+        return
     if action == "user_roles":
         u = get_user(obj_id)
         if not u:
@@ -1268,7 +1322,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         uname = f"@{u['username']}" if u["username"] else "(нет username)"
         text = (
             f"👤 Изменить роль\n\n"
-            f"Пользователь: *{u['full_name'] or ''}*\n"
+            f"Пользователь: *{_user_display_name(u)}*\n"
             f"ID: `{u['id']}`\n"
             f"Username: {uname}\n"
             f"Текущая роль: `{current_role}`\n\n"
@@ -2151,6 +2205,127 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_mode = context.user_data.get("admin_mode")
     if admin_mode and user_row["role"] == "admin":
+        if admin_mode == "approve_set_friendly_name":
+            pending = context.user_data.get("pending_user_setup") or {}
+            if not pending:
+                context.user_data.pop("admin_mode", None)
+                await update.message.reply_text("Данные пользователя утеряны. Попробуйте снова.")
+                return
+            friendly = text.strip()
+            if not friendly:
+                await update.message.reply_text("Friendly name не может быть пустым. Введите значение ещё раз.")
+                return
+            pending["friendly_name"] = friendly
+            context.user_data["pending_user_setup"] = pending
+            context.user_data["admin_mode"] = "approve_set_max_days"
+            suggested = pending.get("suggested_max_days", 0)
+            await update.message.reply_text(
+                "Введите `max_days` (целое число, 0 = без ограничений)\n"
+                f"Рекомендация для роли {pending['role']}: {suggested}",
+                parse_mode="Markdown",
+            )
+            return
+
+        if admin_mode == "approve_set_max_days":
+            pending = context.user_data.get("pending_user_setup") or {}
+            if not pending or "friendly_name" not in pending:
+                context.user_data.pop("admin_mode", None)
+                await update.message.reply_text("Данные пользователя утеряны. Попробуйте снова.")
+                return
+            try:
+                max_days = int(text.strip())
+                if max_days < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text(
+                    "max_days должно быть целым числом ≥ 0. Попробуйте ещё раз."
+                )
+                return
+
+            target_id = pending["target_id"]
+            role = pending["role"]
+            friendly = pending["friendly_name"]
+
+            update_user_role(target_id, role, max_days=max_days)
+            update_user_friendly_name(target_id, friendly)
+
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("pending_user_setup", None)
+
+            await update.message.reply_text(
+                f"✅ Пользователь {target_id} получил роль `{role}`.\n"
+                f"Friendly name: {friendly}\n"
+                f"max_days: {max_days}",
+                parse_mode="Markdown",
+            )
+
+            try:
+                from telegram import ReplyKeyboardRemove
+
+                if role == "blocked":
+                    txt = "⛔ Вам отказано в доступе к боту. Обратитесь к администратору."
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text=txt,
+                        reply_markup=ReplyKeyboardRemove(),
+                    )
+                elif role in ("manager", "accountant", "admin"):
+                    txt = "✅ Вам предоставлен доступ к боту."
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text=txt,
+                        reply_markup=build_main_menu(role),
+                    )
+                else:
+                    txt = f"Ваша роль в боте изменена на: {role}."
+                    await context.bot.send_message(chat_id=target_id, text=txt)
+            except Exception:
+                pass
+
+            await handle_admin_menu(update, context, user_row)
+            return
+
+        if admin_mode == "edit_user_friendly_name":
+            target_id = context.user_data.get("edit_user_target_id")
+            if not target_id:
+                context.user_data.pop("admin_mode", None)
+                await update.message.reply_text("Нет выбранного пользователя.")
+                return
+            friendly = text.strip()
+            if not friendly:
+                await update.message.reply_text("Имя не может быть пустым. Введите значение снова.")
+                return
+            update_user_friendly_name(target_id, friendly)
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("edit_user_target_id", None)
+            await update.message.reply_text("Friendly name обновлено.")
+            return
+
+        if admin_mode == "edit_user_max_days":
+            target_id = context.user_data.get("edit_user_target_id")
+            if not target_id:
+                context.user_data.pop("admin_mode", None)
+                await update.message.reply_text("Нет выбранного пользователя.")
+                return
+            try:
+                max_days = int(text.strip())
+                if max_days < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("Введите целое число ≥ 0.")
+                return
+            user_info = get_user(target_id)
+            if not user_info:
+                context.user_data.pop("admin_mode", None)
+                context.user_data.pop("edit_user_target_id", None)
+                await update.message.reply_text("Пользователь не найден.")
+                return
+            update_user_role(target_id, user_info["role"], max_days=max_days)
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("edit_user_target_id", None)
+            await update.message.reply_text("max_days обновлён.")
+            return
+
         # --- добавление организации ---
         if admin_mode == "add_org_name":
             context.user_data["new_org_name"] = text
