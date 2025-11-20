@@ -1,6 +1,7 @@
 # db.py
 
 from typing import List, Dict, Any, Optional
+import json
 from contextlib import contextmanager
 import pymysql
 import pymysql.cursors
@@ -448,3 +449,69 @@ def get_ignore_ibans_norm() -> set[str]:
             cur.execute("SELECT iban_norm FROM ignore_counter_iban")
             rows = cur.fetchall()
             return {row["iban_norm"] for row in rows if row["iban_norm"]}
+
+
+# --- User action logging ---
+
+
+_USER_ACTION_CACHE: Dict[str, int] = {}
+
+
+def get_or_create_user_action_id(action_name: str) -> int:
+    """
+    Returns the ID of a user action from user_actions table.
+    Creates the row if it does not exist yet and caches results in-memory.
+    """
+
+    cached = _USER_ACTION_CACHE.get(action_name)
+    if cached is not None:
+        return cached
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM user_actions WHERE name=%s", (action_name,))
+            row = cur.fetchone()
+            if row:
+                action_id = int(row["id"])
+                _USER_ACTION_CACHE[action_name] = action_id
+                return action_id
+
+            cur.execute(
+                "INSERT INTO user_actions (name) VALUES (%s)",
+                (action_name,),
+            )
+            action_id = int(cur.lastrowid)
+            conn.commit()
+
+            _USER_ACTION_CACHE[action_name] = action_id
+            return action_id
+
+
+def log_user_action(
+    user_id: int,
+    action_name: str,
+    result: int,
+    params: Optional[Dict[str, Any]] = None,
+    output: Optional[str] = None,
+) -> None:
+    """
+    Writes a record about user activity into user_action_log.
+
+    result: 1 for success, 0 for failure.
+    params: JSON-serializable payload with user-provided parameters.
+    output: Text shown to the user (e.g., payments text or statement filename).
+    """
+
+    action_id = get_or_create_user_action_id(action_name)
+    params_json = json.dumps(params, ensure_ascii=False) if params is not None else None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_action_log (performed_at, user_id, action_id, result, params, output)
+                VALUES (NOW(), %s, %s, %s, %s, %s)
+                """,
+                (user_id, action_id, int(result), params_json, output),
+            )
+        conn.commit()

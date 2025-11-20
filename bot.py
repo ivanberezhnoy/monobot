@@ -50,6 +50,7 @@ from db import (
     get_user_account_permissions_map,
     update_user_account_permissions,
     update_user_friendly_name,
+    log_user_action,
 )
 from monobank_api import (
     unix_from_str,
@@ -1656,6 +1657,24 @@ async def show_payments_for_period(
     Показывает приходные операции по одной карте или по всем доступным картам.
     """
 
+    action_params = {
+        "from": datetime.fromtimestamp(from_ts).isoformat(),
+        "to": datetime.fromtimestamp(to_ts).isoformat(),
+        "accounts": [],
+    }
+
+    def log_action(result: int, output: str) -> None:
+        try:
+            log_user_action(
+                user_id=user_row["id"],
+                action_name="payments",
+                result=result,
+                params=action_params,
+                output=output,
+            )
+        except Exception:
+            logging.exception("Failed to log payments action")
+
     # --- Проверка лимита по дням ---
     if not user_has_unlimited_days(user_row):
         days = (to_ts - from_ts) / 86400.0
@@ -1664,6 +1683,7 @@ async def show_payments_for_period(
                 source,
                 f"Выбранный период превышает допустимый лимит {user_row['max_days']} дней.",
             )
+            log_action(0, "Период превышает допустимый лимит")
             return
 
     ignore_ibans = get_ignore_ibans_norm()
@@ -1676,14 +1696,14 @@ async def show_payments_for_period(
             acc_id = int(account_key)
         except ValueError:
             await _reply(source, "Некорректный идентификатор карты.")
+            log_action(0, "Некорректный идентификатор карты")
             return
         accounts = [acc for acc in available_accounts if acc["id"] == acc_id]
 
     if not accounts:
         await _reply(source, "Нет доступных карт.")
+        log_action(0, "Нет доступных карт")
         return
-
-    from datetime import datetime
 
     all_lines: list[str] = []
     total_ops = 0
@@ -1691,6 +1711,7 @@ async def show_payments_for_period(
     # --- Кеш организаций и сбор токенов ---
     org_cache: Dict[int, Dict[str, Any]] = {}
     tokens: set[str] = set()
+    account_labels: list[str] = []
 
     for acc in accounts:
         org_id = acc.get("organization_id")
@@ -1711,21 +1732,28 @@ async def show_payments_for_period(
 
         tokens.add(token)
 
+        org_name = org.get("name") if org else "?"
+        account_labels.append(f"{org_name} – {acc['name']}")
+
+    action_params["accounts"] = account_labels
+
     if not tokens:
         await _reply(
             source,
             "Для выбранных карт не найдено активных организаций с токенами Monobank.",
         )
+        log_action(0, "Нет активных организаций с токенами")
         return
 
     # --- Проверяем лимит Monobank по всем токенам ---
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
-        await _reply(
-            source,
+        msg = (
             "Monobank дозволяє отримувати виписку не частіше, ніж раз на хвилину.\n"
-            f"Спробуйте ще раз через {max_wait_left} с.",
+            f"Спробуйте ще раз через {max_wait_left} с."
         )
+        await _reply(source, msg)
+        log_action(0, msg)
         return
 
     # --- Основной цикл по аккаунтам ---
@@ -1760,6 +1788,7 @@ async def show_payments_for_period(
                 else:
                     msg += "Спробуйте ще раз трохи пізніше."
                 await _reply(source, msg)
+                log_action(0, msg)
                 return
             raise
 
@@ -1800,11 +1829,14 @@ async def show_payments_for_period(
             total_ops += 1
 
     if total_ops == 0:
-        await _reply(source, "Нет платежей за выбранный период.")
+        msg = "Нет платежей за выбранный период."
+        await _reply(source, msg)
+        log_action(0, msg)
         return
 
     text = "\n".join(all_lines)
     await _reply(source, text)
+    log_action(1, text)
 
 
 # --- Выписка (Excel) ---
@@ -1998,6 +2030,24 @@ async def generate_and_send_statement(
     from_raw: str,
     to_raw: str,
 ):
+    action_params = {
+        "from": from_raw,
+        "to": to_raw,
+        "accounts": [],
+    }
+
+    def log_action(result: int, output: str) -> None:
+        try:
+            log_user_action(
+                user_id=user_row["id"],
+                action_name="statement",
+                result=result,
+                params=action_params,
+                output=output,
+            )
+        except Exception:
+            logging.exception("Failed to log statement action")
+
     # --- проверка лимита дней ---
     if not user_has_unlimited_days(user_row):
         days = (to_ts - from_ts) / 86400.0
@@ -2006,6 +2056,7 @@ async def generate_and_send_statement(
                 source,
                 f"Выбранный период превышает допустимый лимит {user_row['max_days']} дней.",
             )
+            log_action(0, "Период превышает допустимый лимит")
             return
 
     ignore_ibans = get_ignore_ibans_norm()
@@ -2018,11 +2069,13 @@ async def generate_and_send_statement(
             acc_id = int(account_key)
         except ValueError:
             await _reply(source, "Некорректный идентификатор карты.")
+            log_action(0, "Некорректный идентификатор карты")
             return
         accounts = [acc for acc in available_accounts if acc["id"] == acc_id]
 
     if not accounts:
         await _reply(source, "Нет доступных карт для выписки.")
+        log_action(0, "Нет доступных карт для выписки")
         return
 
     from datetime import datetime
@@ -2031,6 +2084,7 @@ async def generate_and_send_statement(
 
     org_cache: Dict[int, Dict[str, Any]] = {}
     tokens: set[str] = set()
+    account_labels: list[str] = []
 
     for acc in accounts:
         org_id = acc.get("organization_id")
@@ -2051,20 +2105,27 @@ async def generate_and_send_statement(
 
         tokens.add(token)
 
+        org_name = org.get("name") if org else "?"
+        account_labels.append(f"{org_name} – {acc['name']}")
+
+    action_params["accounts"] = account_labels
+
     if not tokens:
         await _reply(
             source,
             "Для выбранных карт не найдено активных организаций с токенами Monobank.",
         )
+        log_action(0, "Нет активных организаций с токенами")
         return
 
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
-        await _reply(
-            source,
+        msg = (
             "Monobank дозволяє отримувати виписку не частіше, ніж раз на хвилину.\n"
-            f"Спробуйте ще раз через {max_wait_left} с.",
+            f"Спробуйте ще раз через {max_wait_left} с."
         )
+        await _reply(source, msg)
+        log_action(0, msg)
         return
 
     for acc in accounts:
@@ -2089,6 +2150,7 @@ async def generate_and_send_statement(
                 else:
                     msg += "Спробуйте ще раз трохи пізніше."
                 await _reply(source, msg)
+                log_action(0, msg)
                 return
             raise
 
@@ -2130,7 +2192,9 @@ async def generate_and_send_statement(
             )
 
     if not rows:
-        await _reply(source, "Нет платежей за выбранный период.")
+        msg = "Нет платежей за выбранный период."
+        await _reply(source, msg)
+        log_action(0, msg)
         return
 
     rows.sort(key=lambda r: (r["_token_id"], r["_account_id"], r["datetime"]))
@@ -2145,6 +2209,7 @@ async def generate_and_send_statement(
         chat_id = source.message.chat_id
     else:
         logging.warning("Cannot determine chat_id for sending statement file")
+        log_action(0, "Не удалось определить chat_id для отправки файла")
         return
 
     await context.bot.send_document(
@@ -2153,6 +2218,8 @@ async def generate_and_send_statement(
         filename=filename,
         caption=f"Выписка за период {from_raw} — {to_raw}",
     )
+
+    log_action(1, filename)
 
 
 # --- Админ-меню (entry point) ---

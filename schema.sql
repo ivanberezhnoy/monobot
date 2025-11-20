@@ -94,6 +94,8 @@ COLLATE = utf8mb4_0900_ai_ci;
 -- Table `statementbot`.`user_accounts`
 -- -----------------------------------------------------
 DROP TABLE IF EXISTS `statementbot`.`user_accounts` ;
+DROP TABLE IF EXISTS `statementbot`.`user_action_log` ;
+DROP TABLE IF EXISTS `statementbot`.`user_actions` ;
 
 CREATE TABLE IF NOT EXISTS `statementbot`.`user_accounts` (
   `user_id` BIGINT UNSIGNED NOT NULL,
@@ -132,6 +134,48 @@ CREATE TABLE IF NOT EXISTS `statementbot`.`users` (
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`))
+ENGINE = InnoDB
+DEFAULT CHARACTER SET = utf8mb4
+COLLATE = utf8mb4_0900_ai_ci;
+
+
+-- -----------------------------------------------------
+-- Table `statementbot`.`user_actions`
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS `statementbot`.`user_actions` (
+  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `name` VARCHAR(255) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE INDEX `idx_user_actions_name` (`name` ASC) VISIBLE)
+ENGINE = InnoDB
+DEFAULT CHARACTER SET = utf8mb4
+COLLATE = utf8mb4_0900_ai_ci;
+
+
+-- -----------------------------------------------------
+-- Table `statementbot`.`user_action_log`
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS `statementbot`.`user_action_log` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `performed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `user_id` BIGINT UNSIGNED NOT NULL,
+  `action_id` INT UNSIGNED NOT NULL,
+  `result` TINYINT(1) NOT NULL DEFAULT '0',
+  `params` JSON NULL,
+  `output` LONGTEXT NULL,
+  PRIMARY KEY (`id`),
+  INDEX `idx_user_action_log_user` (`user_id` ASC) VISIBLE,
+  INDEX `idx_user_action_log_action` (`action_id` ASC) VISIBLE,
+  CONSTRAINT `fk_user_action_log_user`
+    FOREIGN KEY (`user_id`)
+    REFERENCES `statementbot`.`users` (`id`)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE,
+  CONSTRAINT `fk_user_action_log_action`
+    FOREIGN KEY (`action_id`)
+    REFERENCES `statementbot`.`user_actions` (`id`)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE)
 ENGINE = InnoDB
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
