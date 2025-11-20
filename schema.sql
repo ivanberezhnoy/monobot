@@ -139,9 +139,12 @@ DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
 
+DROP TABLE IF EXISTS `statementbot`.`user_action_log`;
+DROP TABLE IF EXISTS `statementbot`.`user_actions`;
 -- -----------------------------------------------------
 -- Table `statementbot`.`user_actions`
 -- -----------------------------------------------------
+DROP TABLE IF EXISTS `statementbot`.`user_actions`;
 CREATE TABLE IF NOT EXISTS `statementbot`.`user_actions` (
   `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
   `name` VARCHAR(255) NOT NULL,
@@ -155,6 +158,7 @@ COLLATE = utf8mb4_0900_ai_ci;
 -- -----------------------------------------------------
 -- Table `statementbot`.`user_action_log`
 -- -----------------------------------------------------
+DROP TABLE IF EXISTS `statementbot`.`user_action_log`;
 CREATE TABLE IF NOT EXISTS `statementbot`.`user_action_log` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `performed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
