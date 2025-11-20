@@ -54,13 +54,7 @@ def write_xlsx(output_path: str, rows: List[Dict[str, Any]]) -> None:
     account_total_out = 0.0
 
     def write_account_total():
-        nonlocal (
-            current_row,
-            account_total_in,
-            account_total_out,
-            current_account_name,
-            current_account_id,
-        )
+        nonlocal current_row, account_total_in, account_total_out, current_account_name, current_account_id
         if current_account_id is None:
             return
         label = f"Итого по счёту {current_account_name}"
@@ -91,13 +85,7 @@ def write_xlsx(output_path: str, rows: List[Dict[str, Any]]) -> None:
         account_total_out = 0.0
 
     def write_token_total():
-        nonlocal (
-            current_row,
-            token_total_in,
-            token_total_out,
-            current_token_name,
-            current_token_id,
-        )
+        nonlocal current_row, token_total_in, token_total_out, current_token_name, current_token_id
         if current_token_id is None:
             return
         label = f"Итого по токену {current_token_name}"

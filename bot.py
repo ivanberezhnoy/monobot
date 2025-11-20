@@ -50,6 +50,7 @@ from monobank_api import (
     unix_from_str,
     fetch_statement,
     filter_income_and_ignore,
+    fetch_client_info,
 )
 from report_xlsx import write_xlsx
 
@@ -866,7 +867,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # --- дальше нужны ID ---
-    if action in ("acc_org", "acc_add", "acc_list", "acc_info", "user", "user_roles"):
+    if action in (
+        "acc_org",
+        "acc_add",
+        "acc_add_select",
+        "acc_list",
+        "acc_info",
+        "user",
+        "user_roles",
+    ):
         if len(parts) < 3:
             await query.edit_message_text(
                 "Некорректные данные admin callback (ожидается ID)."
@@ -918,17 +927,94 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Организация не найдена.")
             return
 
-        context.user_data["admin_mode"] = "add_account_mono_id"
-        context.user_data["acc_org_id"] = org["id"]
-        context.user_data.pop("acc_mono_id", None)
-        context.user_data.pop("acc_name", None)
-        context.user_data.pop("acc_iban", None)
-        context.user_data.pop("acc_currency_code", None)
+        token = org.get("token")
+        if not token:
+            await query.edit_message_text(
+                "У выбранной организации не задан токен Monobank. Сначала добавьте токен."
+            )
+            return
+
+        try:
+            client_info = fetch_client_info(token)
+        except HTTPError as e:
+            await query.edit_message_text(
+                "Не удалось получить список счетов из Monobank "
+                f"(HTTP {e.response.status_code if e.response else '??'})."
+            )
+            return
+        except Exception as exc:
+            logging.exception("Failed to fetch client info for org %s", org["id"])
+            await query.edit_message_text(
+                "Не удалось получить список счетов из Monobank. Попробуйте позже."
+            )
+            return
+
+        api_accounts = client_info.get("accounts") or []
+        existing = {
+            acc["mono_account_id"]
+            for acc in list_accounts_by_org(org["id"])
+            if acc.get("mono_account_id")
+        }
+
+        options: list[dict[str, Any]] = []
+        for idx, api_acc in enumerate(api_accounts, start=1):
+            mono_id = api_acc.get("id")
+            iban = (api_acc.get("iban") or "").strip()
+            if not mono_id or not iban:
+                continue
+            if mono_id in existing:
+                continue
+            currency_code = api_acc.get("currencyCode")
+            options.append(
+                {
+                    "option_id": str(idx),
+                    "mono_account_id": mono_id,
+                    "iban": iban,
+                    "currency_code": currency_code,
+                    "raw": api_acc,
+                }
+            )
+
+        if not options:
+            await query.edit_message_text(
+                "Для этой организации нет новых счетов с IBAN, которые можно добавить."
+            )
+            return
+
+        option_map = {opt["option_id"]: opt for opt in options}
+        context.user_data["acc_add_state"] = {
+            "org_id": org["id"],
+            "org_name": org["name"],
+            "options": option_map,
+        }
+
+        keyboard_rows = []
+        for opt in options:
+            currency_code = opt["currency_code"]
+            currency_label = f"{currency_code}" if currency_code else "?"
+            label = f"{opt['iban']} — {currency_label}"
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"admin:acc_add_select:{org['id']}:{opt['option_id']}",
+                    )
+                ]
+            )
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"admin:acc_org:{org['id']}",
+                )
+            ]
+        )
 
         await query.edit_message_text(
-            f"Организация: *{org['name']}*\n\n"
-            "Введите *идентификатор счёта* в Monobank (account id из client-info):",
+            f"Организация: *{org['name']}*\nВыберите счёт (IBAN) из Monobank:",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
         )
         return
 
@@ -963,6 +1049,42 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             "Выберите карту, чтобы посмотреть подробную информацию.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if action == "acc_add_select":
+        if len(parts) < 4:
+            await query.edit_message_text("Некорректные данные для выбора счёта.")
+            return
+
+        option_id = parts[3]
+        state = context.user_data.get("acc_add_state") or {}
+        if state.get("org_id") != obj_id:
+            await query.edit_message_text(
+                "Данные по выбранной организации устарели. Начните добавление заново."
+            )
+            return
+
+        option = (state.get("options") or {}).get(option_id)
+        if not option:
+            await query.edit_message_text(
+                "Этот счёт больше недоступен. Попробуйте выбрать снова."
+            )
+            return
+
+        context.user_data["admin_mode"] = "add_account_name"
+        context.user_data["acc_org_id"] = obj_id
+        context.user_data["acc_mono_id"] = option["mono_account_id"]
+        context.user_data["acc_iban"] = option["iban"]
+        context.user_data["acc_currency_code"] = option.get("currency_code")
+        context.user_data["acc_add_state_option"] = option
+        context.user_data["acc_add_state_org_name"] = state.get("org_name")
+
+        await query.edit_message_text(
+            f"Организация: *{state.get('org_name', '?')}*\n"
+            f"IBAN: `{option['iban']}`\n\n"
+            "Введите *имя счёта*, под которым он будет отображаться:",
+            parse_mode="Markdown",
         )
         return
 
@@ -1964,78 +2086,49 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_admin_menu(update, context, user_row)
             return
 
-        # --- добавление счёта ---
-        if admin_mode == "add_account_mono_id":
-            context.user_data["acc_mono_id"] = text.strip()
-            context.user_data["admin_mode"] = "add_account_name"
-
-            await update.message.reply_text(
-                "Введите *имя счёта* (как оно будет отображаться в отчётах):",
-                parse_mode="Markdown",
-            )
-            return
-
         if admin_mode == "add_account_name":
-            context.user_data["acc_name"] = text.strip()
-            context.user_data["admin_mode"] = "add_account_iban"
-
-            await update.message.reply_text(
-                "Введите *IBAN* (или `-`, если IBAN отсутствует):",
-                parse_mode="Markdown",
-            )
-            return
-
-        if admin_mode == "add_account_iban":
-            iban = text.strip()
-            if iban == "-":
-                iban = None
-            context.user_data["acc_iban"] = iban
-            context.user_data["admin_mode"] = "add_account_currency"
-
-            await update.message.reply_text(
-                "Введите *код валюты* (например, `980` для UAH):",
-                parse_mode="Markdown",
-            )
-            return
-
-        if admin_mode == "add_account_currency":
-            try:
-                currency_code = int(text.strip())
-            except ValueError:
+            acc_name = text.strip()
+            if not acc_name:
                 await update.message.reply_text(
-                    "Код валюты должен быть числом (например, `980`). Попробуйте ещё раз."
+                    "Имя счёта не может быть пустым. Введите другое значение:"
                 )
                 return
 
             org_id = context.user_data.get("acc_org_id")
             mono_id = context.user_data.get("acc_mono_id")
-            acc_name = context.user_data.get("acc_name")
             acc_iban = context.user_data.get("acc_iban")
+            currency_code = context.user_data.get("acc_currency_code")
 
-            if not org_id or not mono_id or not acc_name:
+            if not org_id or not mono_id:
                 context.user_data.pop("admin_mode", None)
-                context.user_data.pop("acc_org_id", None)
-                context.user_data.pop("acc_mono_id", None)
-                context.user_data.pop("acc_name", None)
-                context.user_data.pop("acc_iban", None)
                 await update.message.reply_text(
-                    "Данные счёта потеряны, попробуйте ещё раз через меню Администрирования."
+                    "Данные о счёте потеряны. Начните добавление заново через меню Администрирования."
                 )
                 return
+
+            currency_value = None
+            if currency_code not in (None, ""):
+                try:
+                    currency_value = int(currency_code)
+                except (ValueError, TypeError):
+                    currency_value = None
 
             acc = insert_account(
                 organization_id=int(org_id),
                 mono_account_id=mono_id,
                 name=acc_name,
                 iban=acc_iban,
-                currency_code=currency_code,
+                currency_code=currency_value,
             )
 
             context.user_data.pop("admin_mode", None)
             context.user_data.pop("acc_org_id", None)
             context.user_data.pop("acc_mono_id", None)
-            context.user_data.pop("acc_name", None)
             context.user_data.pop("acc_iban", None)
+            context.user_data.pop("acc_currency_code", None)
+            context.user_data.pop("acc_add_state", None)
+            context.user_data.pop("acc_add_state_option", None)
+            context.user_data.pop("acc_add_state_org_name", None)
 
             org = get_organization_by_id(acc["organization_id"])
             org_name = org["name"] if org else "(неизвестно)"
@@ -2166,7 +2259,7 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             admin_user_accounts_perm,
-            pattern=rf"^{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:\d+(?::\d+){0,2}(?::(?:in|out|all))?$",
+            pattern=rf"^{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:[\d:]+(?::(?:in|out|all))?$",
         )
     )
 
