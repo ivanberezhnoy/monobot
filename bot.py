@@ -48,6 +48,7 @@ from monobank_api import (
     unix_from_str,
     fetch_statement,
     filter_income_and_ignore,
+    fetch_client_info,
 )
 from report_xlsx import write_xlsx
 
@@ -640,7 +641,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # --- дальше нужны ID ---
-    if action in ("acc_org", "acc_add", "acc_list", "acc_info", "user", "user_roles"):
+    if action in (
+        "acc_org",
+        "acc_add",
+        "acc_choose",
+        "acc_list",
+        "acc_info",
+        "user",
+        "user_roles",
+    ):
         if len(parts) < 3:
             await query.edit_message_text(
                 "Некорректные данные admin callback (ожидается ID)."
@@ -685,6 +694,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    
     # --- Запуск диалога добавления счёта ---
     if action == "acc_add":
         org = get_organization_by_id(obj_id)
@@ -692,16 +702,111 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Организация не найдена.")
             return
 
-        context.user_data["admin_mode"] = "add_account_mono_id"
+        try:
+            client_info = fetch_client_info(org["token"])
+        except HTTPError as exc:
+            await query.edit_message_text(
+                "Не удалось получить счета через Monobank API. Проверьте токен организации."
+            )
+            logging.exception("Failed to fetch client-info: %s", exc)
+            return
+        except Exception as exc:
+            await query.edit_message_text("Произошла ошибка при запросе счетов.")
+            logging.exception("Unexpected error during client-info fetch: %s", exc)
+            return
+
+        existing_accounts = list_accounts_by_org(org["id"])
+        existing_mono_ids = {acc["mono_account_id"] for acc in existing_accounts}
+
+        accounts_data = client_info.get("accounts") or []
+        available_accounts: dict[str, dict[str, Any]] = {}
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+        for acc in accounts_data:
+            mono_id = acc.get("id")
+            if not mono_id or mono_id in existing_mono_ids:
+                continue
+
+            currency_code = acc.get("currencyCode")
+            iban = acc.get("iban") or None
+            masked_pan = " / ".join(acc.get("maskedPan", []) or [])
+            label_parts = [masked_pan or "Без карты"]
+            if currency_code:
+                label_parts.append(str(currency_code))
+            button_label = " • ".join(label_parts)
+
+            available_accounts[mono_id] = {
+                "iban": iban,
+                "currency_code": currency_code,
+            }
+
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        button_label,
+                        callback_data=f"admin:acc_choose:{org['id']}:{mono_id}",
+                    )
+                ]
+            )
+
+        if not keyboard_rows:
+            await query.edit_message_text(
+                "Нет счетов для добавления: все счета уже добавлены или не получены из API.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"admin:acc_org:{org['id']}"
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        context.user_data["admin_mode"] = None
         context.user_data["acc_org_id"] = org["id"]
-        context.user_data.pop("acc_mono_id", None)
-        context.user_data.pop("acc_name", None)
-        context.user_data.pop("acc_iban", None)
-        context.user_data.pop("acc_currency_code", None)
+        context.user_data["acc_candidates"] = available_accounts
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"admin:acc_org:{org['id']}"
+                )
+            ]
+        )
 
         await query.edit_message_text(
-            f"Организация: *{org['name']}*\n\n"
-            "Введите *идентификатор счёта* в Monobank (account id из client-info):",
+            f"Организация: *{org['name']}*\n\nВыберите счет для добавления:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+        return
+
+    # --- Выбор счёта из списка Monobank ---
+    if action == "acc_choose":
+        if len(parts) < 4:
+            await query.edit_message_text("Некорректные данные при выборе счёта.")
+            return
+
+        org_id = obj_id
+        mono_acc_id = parts[3]
+        candidates = context.user_data.get("acc_candidates") or {}
+        acc_data = candidates.get(mono_acc_id)
+        if not acc_data:
+            await query.edit_message_text(
+                "Данные счёта не найдены. Попробуйте снова через меню организации."
+            )
+            return
+
+        context.user_data["admin_mode"] = "add_account_name_api"
+        context.user_data["acc_org_id"] = org_id
+        context.user_data["acc_mono_id"] = mono_acc_id
+        context.user_data["acc_iban"] = acc_data.get("iban")
+        context.user_data["acc_currency_code"] = acc_data.get("currency_code")
+
+        await query.edit_message_text(
+            "Введите *имя счёта* (как оно будет отображаться в отчётах):",
             parse_mode="Markdown",
         )
         return
@@ -1681,6 +1786,63 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Организация добавлена.\n\n"
                 f"ID: {org['id']}\n"
                 f"Имя: {org['name']}",
+            )
+
+            await handle_admin_menu(update, context, user_row)
+            return
+
+        if admin_mode == "add_account_name_api":
+            acc_name = text.strip()
+            org_id = context.user_data.get("acc_org_id")
+            mono_id = context.user_data.get("acc_mono_id")
+            acc_iban = context.user_data.get("acc_iban")
+            currency_code = context.user_data.get("acc_currency_code")
+
+            if not acc_name:
+                await update.message.reply_text("Имя счёта не может быть пустым.")
+                return
+
+            if not org_id or not mono_id:
+                context.user_data.pop("admin_mode", None)
+                await update.message.reply_text(
+                    "Данные счёта потеряны, попробуйте ещё раз через меню Администрирования."
+                )
+                return
+
+            try:
+                currency_code_int = (
+                    int(currency_code) if currency_code is not None else None
+                )
+            except ValueError:
+                currency_code_int = None
+
+            acc = insert_account(
+                organization_id=int(org_id),
+                mono_account_id=mono_id,
+                name=acc_name,
+                iban=acc_iban,
+                currency_code=currency_code_int,
+            )
+
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("acc_org_id", None)
+            context.user_data.pop("acc_mono_id", None)
+            context.user_data.pop("acc_name", None)
+            context.user_data.pop("acc_iban", None)
+            context.user_data.pop("acc_currency_code", None)
+            context.user_data.pop("acc_candidates", None)
+
+            org = get_organization_by_id(acc["organization_id"])
+            org_name = org["name"] if org else "(неизвестно)"
+
+            await update.message.reply_text(
+                f"✅ Счёт добавлен.\n\n"
+                f"Организация: {org_name}\n"
+                f"Счёт: {acc['name']}\n"
+                f"Monobank account id: `{acc['mono_account_id']}`\n"
+                f"IBAN: `{acc['iban'] or ''}`\n"
+                f"Код валюты: `{acc['currency_code'] or ''}`",
+                parse_mode="Markdown",
             )
 
             await handle_admin_menu(update, context, user_row)
