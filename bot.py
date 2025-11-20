@@ -3,7 +3,11 @@
 import os
 import time
 import logging
-from typing import List, Dict, Any
+import calendar
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Any, Tuple
+from datetime import datetime, timedelta, date
+from calendar import monthrange
 
 from requests import HTTPError
 from telegram import (
@@ -60,6 +64,14 @@ logging.basicConfig(
 )
 
 STATEMENT_MIN_INTERVAL = 60  # секунды – лимит Monobank на выписку по одному токену
+
+CUSTOM_PERIOD_HELP = (
+    "Отправьте период в одном из форматов:\n"
+    "• `YYYY-MM-DD YYYY-MM-DD`\n"
+    "• `DD DD` — дни текущего месяца (если первое число больше второго, начало в прошлом месяце)\n"
+    "• `DD` — один день текущего месяца\n"
+    "Примеры: `2025-11-01 2025-11-07`, `1 7`, `29 02`, `7`"
+)
 
 
 # --- Вспомогательные функции / меню ---
@@ -127,6 +139,87 @@ def _attach_access_metadata(account: Dict[str, Any], flows: set[str]) -> Dict[st
     acc["access_flows"] = acc_flows
     acc["permissions"] = _permissions_string_from_flows(acc_flows)
     return acc
+
+
+def _parse_iso_date(token: str) -> date | None:
+    try:
+        return datetime.fromisoformat(token).date()
+    except ValueError:
+        return None
+
+
+def _days_in_month(year: int, month: int) -> int:
+    return calendar.monthrange(year, month)[1]
+
+
+def parse_custom_period_input(raw_text: str, *, now: datetime | None = None) -> Tuple[str, str]:
+    """
+    Поддерживает форматы:
+      - "YYYY-MM-DD YYYY-MM-DD"
+      - "DD DD" (дни текущего месяца, при day1>day2 -> начало в предыдущем месяце)
+      - "DD" (один день текущего месяца)
+    Возвращает кортеж (from_date_iso, to_date_iso).
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("empty input")
+
+    now = now or datetime.now()
+    today = now.date()
+    parts = text.replace(",", " ").split()
+
+    def parse_day_token(token: str) -> int | None:
+        if token.isdigit() and 1 <= len(token) <= 2:
+            return int(token)
+        return None
+
+    if len(parts) == 1:
+        token = parts[0]
+        iso = _parse_iso_date(token)
+        if iso:
+            return iso.isoformat(), iso.isoformat()
+
+        day = parse_day_token(token)
+        if day is None:
+            raise ValueError("invalid single token")
+        last_day = _days_in_month(today.year, today.month)
+        if not (1 <= day <= last_day):
+            raise ValueError("day out of range")
+        single_date = date(today.year, today.month, day)
+        return single_date.isoformat(), single_date.isoformat()
+
+    if len(parts) == 2:
+        iso_dates = [_parse_iso_date(token) for token in parts]
+        if iso_dates[0] and iso_dates[1]:
+            start, end = iso_dates
+            if start > end:
+                start, end = end, start
+            return start.isoformat(), end.isoformat()
+
+        day1 = parse_day_token(parts[0])
+        day2 = parse_day_token(parts[1])
+        if day1 is None or day2 is None:
+            raise ValueError("invalid day tokens")
+
+        year_to, month_to = today.year, today.month
+        if day1 > day2:
+            if month_to == 1:
+                year_from, month_from = year_to - 1, 12
+            else:
+                year_from, month_from = year_to, month_to - 1
+        else:
+            year_from, month_from = year_to, month_to
+
+        if day1 > _days_in_month(year_from, month_from):
+            raise ValueError("start day out of range")
+        if day2 > _days_in_month(year_to, month_to):
+            raise ValueError("end day out of range")
+
+        start_date = date(year_from, month_from, day1)
+        end_date = date(year_to, month_to, day2)
+        return start_date.isoformat(), end_date.isoformat()
+
+    raise ValueError("too many tokens")
 
 
 def user_allowed_for_menu(user_row: Dict[str, Any]) -> bool:
@@ -1431,6 +1524,7 @@ async def ask_period_for_payments(
         await source.edit_message_text(
             text, reply_markup=keyboard, parse_mode="Markdown"
         )
+    context.user_data["pay_period_pending"] = account_key
 
 
 async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1458,8 +1552,7 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # data: "pay_per:<account_key>:<mode>"
     _, acc_key, mode = query.data.split(":")
-
-    from datetime import datetime, timedelta
+    context.user_data.pop("pay_period_pending", None)
 
     now = datetime.now()
     today = now.date()
@@ -1484,9 +1577,7 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif mode == "custom":
         context.user_data["pay_custom_acc_id"] = acc_key
         await query.edit_message_text(
-            "Отправьте период в формате:\n"
-            "`YYYY-MM-DD YYYY-MM-DD`\n"
-            "Например: `2025-11-04 2025-11-05`",
+            CUSTOM_PERIOD_HELP,
             parse_mode="Markdown",
         )
         return
@@ -1708,6 +1799,11 @@ async def ask_statement_period(
         await source.edit_message_text(
             text, reply_markup=keyboard, parse_mode="Markdown"
         )
+    account_key = context.user_data.get("stmt_account_key")
+    if account_key is None:
+        account_key = "all" if account is None else str(account["id"])
+        context.user_data["stmt_account_key"] = account_key
+    context.user_data["stmt_period_pending"] = account_key
 
 
 async def handle_statement_entry(
@@ -1798,8 +1894,7 @@ async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     _, mode = query.data.split(":")
-
-    from datetime import datetime, timedelta
+    context.user_data.pop("stmt_period_pending", None)
 
     now = datetime.now()
     today = now.date()
@@ -1816,9 +1911,7 @@ async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         to_raw = today.isoformat()
     elif mode == "custom":
         await query.edit_message_text(
-            "Отправьте период в формате:\n"
-            "`YYYY-MM-DD YYYY-MM-DD`\n"
-            "Например: `2025-11-04 2025-11-05`",
+            CUSTOM_PERIOD_HELP,
             parse_mode="Markdown",
         )
         context.user_data["stmt_waiting_dates"] = True
@@ -2155,18 +2248,62 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_admin_menu(update, context, user_row)
             return
 
-    # --- Кастомные даты для Платежей ---
-    if "pay_custom_acc_id" in context.user_data:
-        parts = text.split()
-        if len(parts) != 2:
+    # --- Быстрый ввод периода в меню "Платежи" ---
+    pending_pay_acc = context.user_data.get("pay_period_pending")
+    if pending_pay_acc is not None and any(ch.isdigit() for ch in text):
+        try:
+            from_raw, to_raw = parse_custom_period_input(text)
+        except ValueError:
             await update.message.reply_text(
-                "Нужно две даты через пробел. Пример:\n"
-                "`2025-11-04 2025-11-05`",
+                CUSTOM_PERIOD_HELP,
                 parse_mode="Markdown",
             )
             return
+        context.user_data.pop("pay_period_pending", None)
+        from_ts = unix_from_str(from_raw, is_to=False)
+        to_ts = unix_from_str(to_raw, is_to=True)
+        await show_payments_for_period(
+            update, context, user_row, pending_pay_acc, from_ts, to_ts
+        )
+        return
 
-        from_raw, to_raw = parts
+    # --- Быстрый ввод периода в меню "Выписка" ---
+    pending_stmt_key = context.user_data.get("stmt_period_pending")
+    if pending_stmt_key is not None and any(ch.isdigit() for ch in text):
+        try:
+            from_raw, to_raw = parse_custom_period_input(text)
+        except ValueError:
+            await update.message.reply_text(
+                CUSTOM_PERIOD_HELP,
+                parse_mode="Markdown",
+            )
+            return
+        context.user_data.pop("stmt_period_pending", None)
+        context.user_data["stmt_account_key"] = pending_stmt_key
+        from_ts = unix_from_str(from_raw, is_to=False)
+        to_ts = unix_from_str(to_raw, is_to=True)
+        await generate_and_send_statement(
+            source=update,
+            context=context,
+            user_row=user_row,
+            account_key=pending_stmt_key,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            from_raw=from_raw,
+            to_raw=to_raw,
+        )
+        return
+
+    # --- Кастомные даты для Платежей ---
+    if "pay_custom_acc_id" in context.user_data:
+        try:
+            from_raw, to_raw = parse_custom_period_input(text)
+        except ValueError:
+            await update.message.reply_text(
+                CUSTOM_PERIOD_HELP,
+                parse_mode="Markdown",
+            )
+            return
         from_ts = unix_from_str(from_raw, is_to=False)
         to_ts = unix_from_str(to_raw, is_to=True)
 
@@ -2183,16 +2320,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Сначала выберите карту для выписки.")
             return
 
-        parts = text.split()
-        if len(parts) != 2:
+        try:
+            from_raw, to_raw = parse_custom_period_input(text)
+        except ValueError:
             await update.message.reply_text(
-                "Нужно две даты через пробел. Пример:\n"
-                "`2025-11-04 2025-11-05`",
+                CUSTOM_PERIOD_HELP,
                 parse_mode="Markdown",
             )
             return
-
-        from_raw, to_raw = parts
         from_ts = unix_from_str(from_raw, is_to=False)
         to_ts = unix_from_str(to_raw, is_to=True)
         context.user_data["stmt_waiting_dates"] = False
