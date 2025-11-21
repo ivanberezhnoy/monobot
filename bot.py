@@ -110,9 +110,7 @@ def _permissions_from_value(value: str | None, *, ensure_income: bool = False) -
             perms = {"in", "out", "balance"}
         else:
             perms = {token for token in tokens if token in {"in", "out", "balance"}}
-    if not perms:
-        perms = {"in"}
-    if ensure_income:
+    if ensure_income and "in" not in perms:
         perms.add("in")
     return perms
 
@@ -122,8 +120,6 @@ def _permissions_string_from_set(perms: set[str]) -> str:
     for key in ("in", "out", "balance"):
         if key in perms:
             ordered.append(key)
-    if not ordered:
-        ordered.append("in")
     return ",".join(ordered)
 
 
@@ -137,10 +133,12 @@ def _flows_to_payments_label(perms: set[str], translator: Translator) -> str:
 
 
 def _permissions_to_short_label(perms: set[str], translator: Translator) -> str:
-    perms = perms or {"in"}
+    perms = perms or set()
     has_in = "in" in perms
     has_out = "out" in perms
     has_balance = "balance" in perms
+    if not (has_in or has_out or has_balance):
+        return translator.t("permissions.short.none")
     parts = []
     if has_in and has_out:
         parts.append(translator.t("permissions.short.all"))
@@ -155,10 +153,19 @@ def _permissions_to_short_label(perms: set[str], translator: Translator) -> str:
 
 def _attach_access_metadata(account: Dict[str, Any], perms: set[str]) -> Dict[str, Any]:
     acc = dict(account)
-    acc_perms = set(perms) or {"in"}
+    acc_perms = set(perms) if perms is not None else set()
     acc["access_permissions"] = acc_perms
     acc["permissions"] = _permissions_string_from_set(acc_perms)
     return acc
+
+
+def _format_currency_code(value: Any) -> str:
+    mapping = {980: "UAH", 840: "USD", 978: "EUR"}
+    try:
+        num_value = int(value)
+    except (TypeError, ValueError):
+        return str(value or "UAH")
+    return mapping.get(num_value, str(num_value))
 
 
 def _user_display_name(user_row: Dict[str, Any]) -> str:
@@ -765,6 +772,11 @@ async def admin_user_accounts_perm(update: Update, context: ContextTypes.DEFAULT
     if not acc:
         await query.edit_message_text(translator.t("errors.account_not_found"))
         return
+
+    perm_map = get_user_account_permissions_map(user_id)
+    current_perms = _permissions_from_value(perm_map.get(account_id))
+
+    acc = {**acc, "permissions": _permissions_string_from_set(current_perms)}
     org = get_organization_by_id(acc["organization_id"])
     org_name = org["name"] if org else "?"
 
@@ -774,7 +786,6 @@ async def admin_user_accounts_perm(update: Update, context: ContextTypes.DEFAULT
         ("balance", translator.t("permissions.payments.balance")),
     )
 
-    current_perms = _permissions_from_value(acc.get("permissions"))
     current_label = _permissions_to_short_label(current_perms, translator)
     base_text = translator.t(
         "permissions.title", account=f"{org_name} – {acc['name']}", current=current_label
@@ -1990,9 +2001,12 @@ async def show_payments_for_period(
 
         org_name = org.get("name") or "?"
         card_label = f"{org_name} – {acc['name']}"
-        flows_allowed = acc.get("access_permissions") or {"in"}
+        flows_allowed = acc.get("access_permissions")
+        if flows_allowed is None:
+            flows_allowed = {"in"}
         allow_in = "in" in flows_allowed
         allow_out = "out" in flows_allowed
+        include_balance = "balance" in flows_allowed
 
         try:
             items = fetch_statement(token, acc["mono_account_id"], from_ts, to_ts)
@@ -2034,6 +2048,8 @@ async def show_payments_for_period(
         header_label = _flows_to_payments_label(included_flows, translator)
         all_lines.append(f"💳 {card_label} — {header_label}")
 
+        last_balance: float | None = None
+
         for it in sorted(filtered_items, key=lambda x: int(x.get("time", 0))):
             t = int(it.get("time", 0))
             dt_str = datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
@@ -2046,7 +2062,19 @@ async def show_payments_for_period(
             all_lines.append(line)
             if comment:
                 all_lines.append(f"  {comment}")
+            if include_balance and it.get("balance") is not None:
+                last_balance = int(it.get("balance", 0)) / 100.0
             total_ops += 1
+
+        if include_balance and last_balance is not None:
+            currency_code = _format_currency_code(acc.get("currency_code"))
+            all_lines.append(
+                translator.t(
+                    "payments.balance_line",
+                    balance=f"{last_balance:.2f}",
+                    currency=currency_code,
+                )
+            )
 
     if total_ops == 0:
         msg = translator.t("payments.no_payments_period")
@@ -2390,9 +2418,12 @@ async def generate_and_send_statement(
                 return
             raise
 
-        flows_allowed = acc.get("access_permissions") or {"in"}
+        flows_allowed = acc.get("access_permissions")
+        if flows_allowed is None:
+            flows_allowed = {"in"}
         allow_in = "in" in flows_allowed
         allow_out = "out" in flows_allowed
+        include_balance = "balance" in flows_allowed
 
         filtered_items, included_flows = filter_income_and_ignore(
             items,
@@ -2405,6 +2436,9 @@ async def generate_and_send_statement(
             continue
 
         flow_label = _flows_to_payments_label(included_flows, translator)
+
+        last_balance: float | None = None
+        last_ts: int | None = None
 
         for it in sorted(filtered_items, key=lambda x: int(x.get("time", 0))):
             t = int(it.get("time", 0))
@@ -2424,6 +2458,33 @@ async def generate_and_send_statement(
                     "comment": comment,
                     "flow": flow,
                     "account_flow_label": flow_label,
+                    "_sort": t,
+                }
+            )
+
+            if include_balance and it.get("balance") is not None:
+                last_ts = t
+                last_balance = int(it.get("balance", 0)) / 100.0
+
+        if include_balance and last_balance is not None:
+            currency_code = _format_currency_code(acc.get("currency_code"))
+            rows.append(
+                {
+                    "_token_id": acc["organization_id"],
+                    "_account_id": acc["id"],
+                    "token_name": org["name"],
+                    "account_name": acc["name"],
+                    "datetime": translator.t(
+                        "payments.balance_line",
+                        balance=f"{last_balance:.2f}",
+                        currency=currency_code,
+                    ),
+                    "amount": last_balance,
+                    "comment": translator.t("payments.balance_label"),
+                    "flow": "balance",
+                    "account_flow_label": flow_label,
+                    "_sort": (last_ts or 0) + 0.1,
+                    "balance_label": translator.t("payments.balance_label"),
                 }
             )
 
@@ -2433,7 +2494,9 @@ async def generate_and_send_statement(
         log_action(0, msg)
         return
 
-    rows.sort(key=lambda r: (r["_token_id"], r["_account_id"], r["datetime"]))
+    rows.sort(
+        key=lambda r: (r["_token_id"], r["_account_id"], r.get("_sort", 0))
+    )
 
     filename = f"выписка_{from_raw}_{to_raw}.xlsx"
     output_path = os.path.join(os.getcwd(), filename)
