@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, date
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta, date
 from calendar import monthrange
+from html import escape
 
 from requests import HTTPError
 from telegram import (
@@ -324,7 +325,7 @@ def mark_statement_call(context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
     bot_data[key] = time.time()
 
 
-async def _reply(source, text: str):
+async def _reply(source, text: str, *, parse_mode: str | None = None):
     """
     Универсальный ответ:
     - Update.message
@@ -333,22 +334,22 @@ async def _reply(source, text: str):
     """
     if isinstance(source, Update):
         if source.message:
-            await source.message.reply_text(text)
+            await source.message.reply_text(text, parse_mode=parse_mode)
         elif source.callback_query and source.callback_query.message:
-            await source.callback_query.message.reply_text(text)
+            await source.callback_query.message.reply_text(text, parse_mode=parse_mode)
         return
 
     if isinstance(source, CallbackQuery):
         if source.message:
-            await source.message.reply_text(text)
+            await source.message.reply_text(text, parse_mode=parse_mode)
         return
 
     if isinstance(source, Message):
-        await source.reply_text(text)
+        await source.reply_text(text, parse_mode=parse_mode)
         return
 
     if hasattr(source, "message") and source.message:
-        await source.message.reply_text(text)
+        await source.message.reply_text(text, parse_mode=parse_mode)
         return
 
     logging.warning("Unsupported source passed to _reply: %r", type(source))
@@ -2046,7 +2047,7 @@ async def show_payments_for_period(
         prev_org_id = org_id
 
         header_label = _flows_to_payments_label(included_flows, translator)
-        all_lines.append(f"💳 {card_label} — {header_label}")
+        all_lines.append(escape(f"💳 {card_label} — {header_label}"))
 
         last_balance: float | None = None
 
@@ -2059,22 +2060,21 @@ async def show_payments_for_period(
             formatted_amount = f"{prefix}{abs(amount):.2f} UAH"
             comment = it.get("comment") or it.get("description") or ""
             line = f"{dt_str} — {formatted_amount}"
-            all_lines.append(line)
+            all_lines.append(escape(line))
             if comment:
-                all_lines.append(f"  {comment}")
+                all_lines.append(escape(f"  {comment}"))
             if include_balance and it.get("balance") is not None:
                 last_balance = int(it.get("balance", 0)) / 100.0
             total_ops += 1
 
         if include_balance and last_balance is not None:
             currency_code = _format_currency_code(acc.get("currency_code"))
-            all_lines.append(
-                translator.t(
-                    "payments.balance_line",
-                    balance=f"{last_balance:.2f}",
-                    currency=currency_code,
-                )
+            balance_line = translator.t(
+                "payments.balance_line",
+                balance=f"{last_balance:.2f}",
+                currency=currency_code,
             )
+            all_lines.append(f"<b>{escape(balance_line)}</b>")
 
     if total_ops == 0:
         msg = translator.t("payments.no_payments_period")
@@ -2083,7 +2083,7 @@ async def show_payments_for_period(
         return
 
     text = "\n".join(all_lines)
-    await _reply(source, text)
+    await _reply(source, text, parse_mode="HTML")
     log_action(1, text)
 
 
