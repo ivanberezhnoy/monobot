@@ -76,13 +76,8 @@ def _translator_from_update(update: Update) -> tuple[Translator, Dict[str, Any] 
 
 STATEMENT_MIN_INTERVAL = 60  # секунды – лимит Monobank на выписку по одному токену
 
-CUSTOM_PERIOD_HELP = (
-    "Отправьте период в одном из форматов:\n"
-    "• `YYYY-MM-DD YYYY-MM-DD`\n"
-    "• `DD DD` — дни текущего месяца (если первое число больше второго, начало в прошлом месяце)\n"
-    "• `DD` — один день текущего месяца\n"
-    "Примеры: `2025-11-01 2025-11-07`, `1 7`, `29 02`, `7`"
-)
+def get_custom_period_help(translator: Translator) -> str:
+    return translator.t("period.custom_help")
 
 
 # --- Вспомогательные функции / меню ---
@@ -1706,32 +1701,34 @@ async def ask_period_for_payments(
         [
             [
                 InlineKeyboardButton(
-                    "⏱ Последний час",
+                    translator.t("payments.period.last_hour"),
                     callback_data=f"pay_per:{account_key}:last_hour",
                 ),
                 InlineKeyboardButton(
-                    "⏱ Последние 3 часа",
+                    translator.t("payments.period.last_3_hours"),
                     callback_data=f"pay_per:{account_key}:last_3_hours",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "📅 Сегодня", callback_data=f"pay_per:{account_key}:today"
+                    translator.t("payments.period.today"),
+                    callback_data=f"pay_per:{account_key}:today",
                 ),
                 InlineKeyboardButton(
-                    "📅 Вчера", callback_data=f"pay_per:{account_key}:yesterday"
+                    translator.t("payments.period.yesterday"),
+                    callback_data=f"pay_per:{account_key}:yesterday",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "✏️ Выбрать период",
+                    translator.t("payments.period.custom"),
                     callback_data=f"pay_per:{account_key}:custom",
                 ),
             ],
         ]
     )
 
-    text = f"Карта: *{card_label}*\nВыберите период:"
+    text = translator.t("payments.period.title", {"card": card_label})
     if hasattr(source, "message") and source.message:
         await source.message.reply_text(
             text, reply_markup=keyboard, parse_mode="Markdown"
@@ -1804,8 +1801,9 @@ async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_row = get_user(query.from_user.id)
+    translator = get_translator_for_user(user_row)
     if not user_row or not user_allowed_for_menu(user_row):
-        await query.edit_message_text("Нет доступа.")
+        await query.edit_message_text(translator.t("errors.no_access"))
         return
 
     _, acc_key = query.data.split(":")  # "all" или "<id>"
@@ -1818,8 +1816,9 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     user_row = get_user(query.from_user.id)
+    translator = get_translator_for_user(user_row)
     if not user_row or not user_allowed_for_menu(user_row):
-        await query.edit_message_text("Нет доступа.")
+        await query.edit_message_text(translator.t("errors.no_access"))
         return
 
     # data: "pay_per:<account_key>:<mode>"
@@ -1849,7 +1848,7 @@ async def pay_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif mode == "custom":
         context.user_data["pay_custom_acc_id"] = acc_key
         await query.edit_message_text(
-            CUSTOM_PERIOD_HELP,
+            get_custom_period_help(translator),
             parse_mode="Markdown",
         )
         return
@@ -1873,6 +1872,8 @@ async def show_payments_for_period(
     account_key: "all" или строковый id карты.
     Показывает приходные операции по одной карте или по всем доступным картам.
     """
+
+    translator = get_translator_for_user(user_row)
 
     action_params = {
         "from": datetime.fromtimestamp(from_ts).isoformat(),
@@ -1898,7 +1899,9 @@ async def show_payments_for_period(
         if days > user_row["max_days"] + 1e-6:
             await _reply(
                 source,
-                f"Выбранный период превышает допустимый лимит {user_row['max_days']} дней.",
+                translator.t(
+                    "errors.period_limit", {"days": user_row["max_days"]}
+                ),
             )
             log_action(0, "Период превышает допустимый лимит")
             return
@@ -1912,13 +1915,13 @@ async def show_payments_for_period(
         try:
             acc_id = int(account_key)
         except ValueError:
-            await _reply(source, "Некорректный идентификатор карты.")
+            await _reply(source, translator.t("errors.invalid_card"))
             log_action(0, "Некорректный идентификатор карты")
             return
         accounts = [acc for acc in available_accounts if acc["id"] == acc_id]
 
     if not accounts:
-        await _reply(source, "Нет доступных карт.")
+        await _reply(source, translator.t("payments.no_available_cards"))
         log_action(0, "Нет доступных карт")
         return
 
@@ -1957,7 +1960,7 @@ async def show_payments_for_period(
     if not tokens:
         await _reply(
             source,
-            "Для выбранных карт не найдено активных организаций с токенами Monobank.",
+            translator.t("statement.no_active_tokens"),
         )
         log_action(0, "Нет активных организаций с токенами")
         return
@@ -1965,10 +1968,8 @@ async def show_payments_for_period(
     # --- Проверяем лимит Monobank по всем токенам ---
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
-        msg = (
-            "Monobank дозволяє отримувати виписку не частіше, ніж раз на хвилину.\n"
-            f"Спробуйте ще раз через {max_wait_left} с."
-        )
+        msg = translator.t("errors.monobank_rate_limit") + "\n"
+        msg += translator.t("errors.monobank_retry_in", {"seconds": max_wait_left})
         await _reply(source, msg)
         log_action(0, msg)
         return
@@ -1999,11 +2000,13 @@ async def show_payments_for_period(
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
                 wait_left = get_statement_wait_left(context, token)
-                msg = "Monobank просить не робити виписку частіше, ніж раз на хвилину.\n"
+                msg = translator.t("errors.monobank_rate_limit") + "\n"
                 if wait_left > 0:
-                    msg += f"Спробуйте ще раз через приблизно {wait_left} с."
+                    msg += translator.t(
+                        "errors.monobank_retry_in", {"seconds": wait_left}
+                    )
                 else:
-                    msg += "Спробуйте ще раз трохи пізніше."
+                    msg += translator.t("errors.monobank_retry_later")
                 await _reply(source, msg)
                 log_action(0, msg)
                 return
@@ -2046,7 +2049,7 @@ async def show_payments_for_period(
             total_ops += 1
 
     if total_ops == 0:
-        msg = "Нет платежей за выбранный период."
+        msg = translator.t("payments.no_payments_period")
         await _reply(source, msg)
         log_action(0, msg)
         return
@@ -2060,15 +2063,19 @@ async def show_payments_for_period(
 
 
 async def ask_statement_period(
-    source, context: ContextTypes.DEFAULT_TYPE, account: Dict[str, Any] | None
+    source,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_row: Dict[str, Any],
+    account: Dict[str, Any] | None,
 ):
     """
     account:
       - None  → режим "Все карты"
       - dict  → конкретная карта
     """
+    translator = get_translator_for_user(user_row)
     if account is None:
-        label = "Все доступные карты"
+        label = translator.t("payments.all_cards_label")
     else:
         org = get_organization_by_id(account["organization_id"])
         org_name = org["name"] if org else "?"
@@ -2077,23 +2084,31 @@ async def ask_statement_period(
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📅 Сегодня", callback_data="stmt_per:today"),
-                InlineKeyboardButton("📅 Вчера", callback_data="stmt_per:yesterday"),
-            ],
-            [
                 InlineKeyboardButton(
-                    "📅 Прошлые 3 дня", callback_data="stmt_per:last3"
+                    translator.t("statement.period.today"),
+                    callback_data="stmt_per:today",
+                ),
+                InlineKeyboardButton(
+                    translator.t("statement.period.yesterday"),
+                    callback_data="stmt_per:yesterday",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "✏️ Выбрать период", callback_data="stmt_per:custom"
+                    translator.t("statement.period.last3"),
+                    callback_data="stmt_per:last3",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    translator.t("statement.period.custom"),
+                    callback_data="stmt_per:custom",
                 ),
             ],
         ]
     )
 
-    text = f"Карта: *{label}*\nВыберите период:"
+    text = translator.t("statement.period.title", {"card": label})
     if hasattr(source, "message") and source.message:
         await source.message.reply_text(
             text, reply_markup=keyboard, parse_mode="Markdown"
@@ -2112,24 +2127,25 @@ async def ask_statement_period(
 async def handle_statement_entry(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]
 ):
+    translator = get_translator_for_user(user_row)
     accounts = get_available_accounts_for_user(user_row)
 
     if not accounts:
         await update.message.reply_text(
-            "К сожалению, у вас нет доступных карт для выписки. Обратитесь к администратору."
+            translator.t("statement.no_accounts"),
         )
         return
 
     if len(accounts) == 1:
         acc = accounts[0]
         context.user_data["stmt_account_key"] = str(acc["id"])
-        await ask_statement_period(update, context, acc)
+        await ask_statement_period(update, context, user_row, acc)
         return
 
     keyboard = []
 
     keyboard.append(
-        [InlineKeyboardButton("💳 Все карты", callback_data="stmt_acc:all")]
+        [InlineKeyboardButton(translator.t("statement.all_cards"), callback_data="stmt_acc:all")]
     )
 
     for acc in accounts:
@@ -2146,7 +2162,7 @@ async def handle_statement_entry(
         )
 
     await update.message.reply_text(
-        "Выберите карту для выписки (или все карты):",
+        translator.t("statement.choose_card"),
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -2156,8 +2172,9 @@ async def stmt_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_row = get_user(query.from_user.id)
+    translator = get_translator_for_user(user_row)
     if not user_row or not user_allowed_for_menu(user_row):
-        await query.edit_message_text("Нет доступа.")
+        await query.edit_message_text(translator.t("errors.no_access"))
         return
 
     _, acc_key = query.data.split(":")  # "all" или "<id>"
@@ -2172,14 +2189,14 @@ async def stmt_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             acc_id = int(acc_key)
         except ValueError:
-            await query.edit_message_text("Некорректный идентификатор карты.")
+            await query.edit_message_text(translator.t("errors.invalid_card"))
             return
         account = next((a for a in available_accounts if a["id"] == acc_id), None)
         if not account:
-            await query.edit_message_text("Карта не найдена или недоступна.")
+            await query.edit_message_text(translator.t("errors.card_unavailable"))
             return
 
-    await ask_statement_period(query, context, account)
+    await ask_statement_period(query, context, user_row, account)
 
 
 async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2187,13 +2204,14 @@ async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     user_row = get_user(query.from_user.id)
+    translator = get_translator_for_user(user_row)
     if not user_row or not user_allowed_for_menu(user_row):
-        await query.edit_message_text("Нет доступа.")
+        await query.edit_message_text(translator.t("errors.no_access"))
         return
 
     account_key = context.user_data.get("stmt_account_key")
     if account_key is None:
-        await query.edit_message_text("Сначала выберите карту для выписки.")
+        await query.edit_message_text(translator.t("statement.select_card_first"))
         return
 
     _, mode = query.data.split(":")
@@ -2214,7 +2232,7 @@ async def stmt_period_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         to_raw = today.isoformat()
     elif mode == "custom":
         await query.edit_message_text(
-            CUSTOM_PERIOD_HELP,
+            get_custom_period_help(translator),
             parse_mode="Markdown",
         )
         context.user_data["stmt_waiting_dates"] = True
@@ -2247,6 +2265,7 @@ async def generate_and_send_statement(
     from_raw: str,
     to_raw: str,
 ):
+    translator = get_translator_for_user(user_row)
     action_params = {
         "from": from_raw,
         "to": to_raw,
@@ -2271,7 +2290,7 @@ async def generate_and_send_statement(
         if days > user_row["max_days"] + 1e-6:
             await _reply(
                 source,
-                f"Выбранный период превышает допустимый лимит {user_row['max_days']} дней.",
+                translator.t("errors.period_limit", {"days": user_row["max_days"]}),
             )
             log_action(0, "Период превышает допустимый лимит")
             return
@@ -2285,13 +2304,13 @@ async def generate_and_send_statement(
         try:
             acc_id = int(account_key)
         except ValueError:
-            await _reply(source, "Некорректный идентификатор карты.")
+            await _reply(source, translator.t("errors.invalid_card"))
             log_action(0, "Некорректный идентификатор карты")
             return
         accounts = [acc for acc in available_accounts if acc["id"] == acc_id]
 
     if not accounts:
-        await _reply(source, "Нет доступных карт для выписки.")
+        await _reply(source, translator.t("statement.no_accounts"))
         log_action(0, "Нет доступных карт для выписки")
         return
 
@@ -2330,17 +2349,15 @@ async def generate_and_send_statement(
     if not tokens:
         await _reply(
             source,
-            "Для выбранных карт не найдено активных организаций с токенами Monobank.",
+            translator.t("statement.no_active_tokens"),
         )
         log_action(0, "Нет активных организаций с токенами")
         return
 
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
-        msg = (
-            "Monobank дозволяє отримувати виписку не частіше, ніж раз на хвилину.\n"
-            f"Спробуйте ще раз через {max_wait_left} с."
-        )
+        msg = translator.t("errors.monobank_rate_limit") + "\n"
+        msg += translator.t("errors.monobank_retry_in", {"seconds": max_wait_left})
         await _reply(source, msg)
         log_action(0, msg)
         return
@@ -2361,11 +2378,13 @@ async def generate_and_send_statement(
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
                 wait_left = get_statement_wait_left(context, token)
-                msg = "Monobank просить не робити виписку частіше, ніж раз на хвилину.\n"
+                msg = translator.t("errors.monobank_rate_limit") + "\n"
                 if wait_left > 0:
-                    msg += f"Спробуйте ще раз через приблизно {wait_left} с."
+                    msg += translator.t(
+                        "errors.monobank_retry_in", {"seconds": wait_left}
+                    )
                 else:
-                    msg += "Спробуйте ще раз трохи пізніше."
+                    msg += translator.t("errors.monobank_retry_later")
                 await _reply(source, msg)
                 log_action(0, msg)
                 return
@@ -2409,7 +2428,7 @@ async def generate_and_send_statement(
             )
 
     if not rows:
-        msg = "Нет платежей за выбранный период."
+        msg = translator.t("payments.no_payments_period")
         await _reply(source, msg)
         log_action(0, msg)
         return
@@ -2433,7 +2452,9 @@ async def generate_and_send_statement(
         chat_id=chat_id,
         document=open(output_path, "rb"),
         filename=filename,
-        caption=f"Выписка за период {from_raw} — {to_raw}",
+        caption=translator.t(
+            "statement.file_caption", {"from": from_raw, "to": to_raw}
+        ),
     )
 
     log_action(1, filename)
