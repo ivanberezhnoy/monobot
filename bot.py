@@ -1728,7 +1728,7 @@ async def ask_period_for_payments(
         ]
     )
 
-    text = translator.t("payments.period.title", {"card": card_label})
+    text = translator.t("payments.period.title", card=card_label)
     if hasattr(source, "message") and source.message:
         await source.message.reply_text(
             text, reply_markup=keyboard, parse_mode="Markdown"
@@ -1969,7 +1969,7 @@ async def show_payments_for_period(
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
         msg = translator.t("errors.monobank_rate_limit") + "\n"
-        msg += translator.t("errors.monobank_retry_in", {"seconds": max_wait_left})
+        msg += translator.t("errors.monobank_retry_in", seconds=max_wait_left)
         await _reply(source, msg)
         log_action(0, msg)
         return
@@ -2108,7 +2108,7 @@ async def ask_statement_period(
         ]
     )
 
-    text = translator.t("statement.period.title", {"card": label})
+    text = translator.t("statement.period.title", card=label)
     if hasattr(source, "message") and source.message:
         await source.message.reply_text(
             text, reply_markup=keyboard, parse_mode="Markdown"
@@ -2290,7 +2290,7 @@ async def generate_and_send_statement(
         if days > user_row["max_days"] + 1e-6:
             await _reply(
                 source,
-                translator.t("errors.period_limit", {"days": user_row["max_days"]}),
+                translator.t("errors.period_limit", days=user_row["max_days"]),
             )
             log_action(0, "Период превышает допустимый лимит")
             return
@@ -2357,7 +2357,7 @@ async def generate_and_send_statement(
     max_wait_left = max(get_statement_wait_left(context, token) for token in tokens)
     if max_wait_left > 0:
         msg = translator.t("errors.monobank_rate_limit") + "\n"
-        msg += translator.t("errors.monobank_retry_in", {"seconds": max_wait_left})
+        msg += translator.t("errors.monobank_retry_in", seconds=max_wait_left)
         await _reply(source, msg)
         log_action(0, msg)
         return
