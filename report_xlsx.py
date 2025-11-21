@@ -178,18 +178,23 @@ def write_xlsx(output_path: str, rows: List[Dict[str, Any]]) -> None:
 
         ws.cell(row=current_row, column=DATE_COL, value=dt_str)
         amount_cell = ws.cell(row=current_row, column=AMOUNT_COL, value=amt)
-        if flow == "out":
-            amount_cell.font = Font(color="FFC00000")
-        else:
-            amount_cell.font = Font(color="FF008000")
-        ws.cell(row=current_row, column=COMMENT_COL, value=comment)
 
-        if flow == "out":
-            account_total_out += amt
-            token_total_out += amt
+        if flow == "balance":
+            amount_cell.font = Font(bold=True)
+            ws.cell(row=current_row, column=COMMENT_COL, value=row.get("balance_label", ""))
         else:
-            account_total_in += amt
-            token_total_in += amt
+            if flow == "out":
+                amount_cell.font = Font(color="FFC00000")
+            else:
+                amount_cell.font = Font(color="FF008000")
+            ws.cell(row=current_row, column=COMMENT_COL, value=comment)
+
+            if flow == "out":
+                account_total_out += amt
+                token_total_out += amt
+            else:
+                account_total_in += amt
+                token_total_in += amt
 
         current_row += 1
 
