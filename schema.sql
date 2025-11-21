@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS `statementbot`.`users` (
   `full_name` VARCHAR(255) NULL DEFAULT NULL,
   `username` VARCHAR(255) NULL DEFAULT NULL,
   `friendly_name` VARCHAR(255) NULL DEFAULT NULL,
+  `language` VARCHAR(8) NOT NULL DEFAULT 'ua',
   `role` ENUM('pending', 'manager', 'accountant', 'admin', 'blocked') NOT NULL DEFAULT 'pending',
   `max_days` INT NOT NULL DEFAULT '3',
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

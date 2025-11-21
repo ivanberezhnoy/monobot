@@ -52,6 +52,7 @@ from db import (
     update_user_friendly_name,
     log_user_action,
 )
+from i18n import DEFAULT_LANGUAGE, Translator, get_translator_for_user
 from monobank_api import (
     unix_from_str,
     fetch_statement,
@@ -64,6 +65,14 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+
+def _translator_from_update(update: Update) -> tuple[Translator, Dict[str, Any] | None]:
+    user_row: Dict[str, Any] | None = None
+    if update and update.effective_user:
+        user_row = get_user(update.effective_user.id)
+    translator = get_translator_for_user(user_row)
+    return translator, user_row
 
 STATEMENT_MIN_INTERVAL = 60  # секунды – лимит Monobank на выписку по одному токену
 
@@ -79,46 +88,52 @@ CUSTOM_PERIOD_HELP = (
 # --- Вспомогательные функции / меню ---
 
 
-def build_main_menu(role: str) -> ReplyKeyboardMarkup:
+def build_main_menu(role: str, translator: Translator | None = None) -> ReplyKeyboardMarkup:
+    translator = translator or Translator(DEFAULT_LANGUAGE)
     buttons = [
-        [KeyboardButton("📥 Платежи"), KeyboardButton("📄 Выписка")],
+        [
+            KeyboardButton(translator.t("main.payments")),
+            KeyboardButton(translator.t("main.statement")),
+        ],
+        [KeyboardButton(translator.t("main.balance"))],
     ]
     if role == "admin":
-        buttons.append([KeyboardButton("🛠 Администрирование")])
+        buttons.append([KeyboardButton(translator.t("main.admin"))])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-def _flows_from_permissions(value: str | None, *, ensure_income: bool = False) -> set[str]:
+def _permissions_from_value(value: str | None, *, ensure_income: bool = False) -> set[str]:
     """
-    Преобразует строку разрешений в множество ("in", "out").
+    Преобразует строку разрешений в множество ("in", "out", "balance").
     ensure_income=True гарантирует присутствие "in" в результате.
     """
     if not value:
-        flows: set[str] = set()
+        perms: set[str] = set()
     else:
         tokens = {chunk.strip().lower() for chunk in value.split(",") if chunk.strip()}
         if "full" in tokens:
-            flows = {"in", "out"}
+            perms = {"in", "out", "balance"}
         else:
-            flows = {token for token in tokens if token in {"in", "out"}}
-    if not flows:
-        flows = {"in"}
+            perms = {token for token in tokens if token in {"in", "out", "balance"}}
+    if not perms:
+        perms = {"in"}
     if ensure_income:
-        flows.add("in")
-    return flows
+        perms.add("in")
+    return perms
 
 
-def _permissions_string_from_flows(flows: set[str]) -> str:
-    flows = set(flows)
-    if "in" in flows and "out" in flows:
-        return "in,out"
-    if "out" in flows and "in" not in flows:
-        return "out"
-    return "in"
+def _permissions_string_from_set(perms: set[str]) -> str:
+    ordered = []
+    for key in ("in", "out", "balance"):
+        if key in perms:
+            ordered.append(key)
+    if not ordered:
+        ordered.append("in")
+    return ",".join(ordered)
 
 
-def _flows_to_payments_label(flows: set[str]) -> str:
-    flows = flows or {"in"}
+def _flows_to_payments_label(perms: set[str]) -> str:
+    flows = {p for p in perms if p in {"in", "out"}} or {"in"}
     if "in" in flows and "out" in flows:
         return "входящие и исходящие платежи"
     if "out" in flows and "in" not in flows:
@@ -126,20 +141,28 @@ def _flows_to_payments_label(flows: set[str]) -> str:
     return "входящие платежи"
 
 
-def _flows_to_short_label(flows: set[str]) -> str:
-    flows = flows or {"in"}
-    if "in" in flows and "out" in flows:
-        return "Все"
-    if "out" in flows and "in" not in flows:
-        return "Исходящие"
-    return "Входящие"
+def _permissions_to_short_label(perms: set[str]) -> str:
+    perms = perms or {"in"}
+    has_in = "in" in perms
+    has_out = "out" in perms
+    has_balance = "balance" in perms
+    parts = []
+    if has_in and has_out:
+        parts.append("Платежи: все")
+    elif has_out and not has_in:
+        parts.append("Платежи: исходящие")
+    else:
+        parts.append("Платежи: входящие")
+    if has_balance:
+        parts.append("Баланс")
+    return ", ".join(parts)
 
 
-def _attach_access_metadata(account: Dict[str, Any], flows: set[str]) -> Dict[str, Any]:
+def _attach_access_metadata(account: Dict[str, Any], perms: set[str]) -> Dict[str, Any]:
     acc = dict(account)
-    acc_flows = set(flows) or {"in"}
-    acc["access_flows"] = acc_flows
-    acc["permissions"] = _permissions_string_from_flows(acc_flows)
+    acc_perms = set(perms) or {"in"}
+    acc["access_permissions"] = acc_perms
+    acc["permissions"] = _permissions_string_from_set(acc_perms)
     return acc
 
 
@@ -256,17 +279,14 @@ def get_available_accounts_for_user(user_row: Dict[str, Any]) -> List[Dict[str, 
         accounts = list_all_active_accounts()
         result = []
         for acc in accounts:
-            flows = _flows_from_permissions(
-                perm_map.get(acc["id"]),
-                ensure_income=True,
-            )
+            flows = _permissions_from_value(perm_map.get(acc["id"]))
             result.append(_attach_access_metadata(acc, flows))
         return result
 
     accounts = get_accounts_for_user(user_id)
     result = []
     for acc in accounts:
-        flows = _flows_from_permissions(acc.get("permissions"))
+        flows = _permissions_from_value(acc.get("permissions"))
         result.append(_attach_access_metadata(acc, flows))
     return result
 
@@ -345,31 +365,32 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username=tg_user.username or "",
     )
 
+    translator = get_translator_for_user(row)
+
     display_name = _user_display_name(row)
 
     if row["role"] == "admin":
         await update.message.reply_text(
-            f"Привет, {display_name} 👋",
-            reply_markup=build_main_menu("admin"),
+            translator.t("start.greeting_admin", name=display_name),
+            reply_markup=build_main_menu("admin", translator),
         )
         return
 
     if row["role"] in ("manager", "accountant"):
         await update.message.reply_text(
-            f"Добро пожаловать, {display_name}! Вы авторизованы ✅",
-            reply_markup=build_main_menu(row["role"]),
+            translator.t("start.greeting_user", name=display_name),
+            reply_markup=build_main_menu(row["role"], translator),
         )
         return
 
     if row["role"] == "blocked":
         await update.message.reply_text(
-            "⛔ Доступ к боту запрещён. Обратитесь к администратору."
+            translator.t("start.blocked")
         )
         return
-
     # pending
     await update.message.reply_text(
-        "Вы отправили запрос на доступ. Ожидайте подтверждения администратора."
+        translator.t("start.pending")
     )
 
     # уведомить всех админов
@@ -431,57 +452,68 @@ async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
+    translator, _ = _translator_from_update(update)
+
     data = query.data  # формат "admin_user_accounts:<user_id>"
     _, user_id_str = data.split(":", 1)
     user_id = int(user_id_str)
 
     user = get_user(user_id)
     if not user:
-        await query.edit_message_text("Пользователь не найден.")
+        await query.edit_message_text(translator.t("Пользователь не найден."))
         return
 
     user_accounts = get_accounts_for_user(user_id)  # счета, доступные этому юзеру
 
     lines: list[str] = [
-        f"Пользователь: {_user_display_name(user)}",
+        translator.t("Пользователь: {name}", name=_user_display_name(user)),
         "",
-        "Доступные счета:",
+        translator.t("Доступные счета:"),
     ]
 
     if not user_accounts:
-        lines.append("  — нет ни одного счета")
+        lines.append(translator.t("  — нет ни одного счета"))
     else:
         for acc in user_accounts:
             org = get_organization_by_id(acc["organization_id"])
             org_name = org["name"] if org else "?"
-            perm_label = _flows_to_short_label(
-                _flows_from_permissions(acc.get("permissions"))
+            perm_label = _permissions_to_short_label(
+                _permissions_from_value(acc.get("permissions"))
             )
-            lines.append(f"  • {org_name} – {acc['name']} (уровень: {perm_label})")
+            lines.append(
+                translator.t(
+                    "  • {org} – {account} (уровень: {perm})",
+                    org=org_name,
+                    account=acc["name"],
+                    perm=perm_label,
+                )
+            )
 
     text = "\n".join(lines)
 
     keyboard = [
         [
             InlineKeyboardButton(
-                "➕ Добавить счёт",
+                translator.t("➕ Добавить счёт"),
                 callback_data=f"{ADMIN_USER_ACCOUNTS_ADD_PREFIX}:{user_id}",
             ),
         ],
         [
             InlineKeyboardButton(
-                "➖ Удалить счёт",
+                translator.t("➖ Удалить счёт"),
                 callback_data=f"{ADMIN_USER_ACCOUNTS_DEL_PREFIX}:{user_id}",
             ),
         ],
         [
             InlineKeyboardButton(
-                "⚙️ Уровень доступа",
+                translator.t("⚙️ Уровень доступа"),
                 callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}",
             ),
         ],
         [
-            InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:user:{user_id}"),
+            InlineKeyboardButton(
+                translator.t("⬅️ Назад"), callback_data=f"admin:user:{user_id}"
+            ),
         ],
     ]
 
@@ -494,6 +526,8 @@ async def admin_user_accounts_menu(update: Update, context: ContextTypes.DEFAULT
 async def admin_user_accounts_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    translator, _ = _translator_from_update(update)
 
     data = query.data  # "admin_user_accounts_add:<user_id>" или "...:<user_id>:<account_id>"
     parts = data.split(":")
@@ -512,12 +546,12 @@ async def admin_user_accounts_add(update: Update, context: ContextTypes.DEFAULT_
 
         if not candidates:
             await query.edit_message_text(
-                "У пользователя уже есть доступ ко всем счетам.",
+                translator.t("У пользователя уже есть доступ ко всем счетам."),
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
-                                "⬅️ Назад",
+                                translator.t("⬅️ Назад"),
                                 callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                             )
                         ]
@@ -530,7 +564,7 @@ async def admin_user_accounts_add(update: Update, context: ContextTypes.DEFAULT_
         for acc in candidates:
             org = get_organization_by_id(acc["organization_id"])
             org_name = org["name"] if org else "?"
-            label = f"{org_name} – {acc['name']}"
+            label = translator.t("{org} – {account}", org=org_name, account=acc["name"])
             keyboard_rows.append(
                 [
                     InlineKeyboardButton(
@@ -543,14 +577,14 @@ async def admin_user_accounts_add(update: Update, context: ContextTypes.DEFAULT_
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    "⬅️ Назад",
+                    translator.t("⬅️ Назад"),
                     callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                 )
             ]
         )
 
         await query.edit_message_text(
-            text="Выберите счёт, который нужно добавить пользователю:",
+            text=translator.t("Выберите счёт, который нужно добавить пользователю:"),
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
         )
 
@@ -566,18 +600,22 @@ async def admin_user_accounts_add(update: Update, context: ContextTypes.DEFAULT_
             [
                 [
                     InlineKeyboardButton(
-                        "⬅️ Назад",
+                        translator.t("⬅️ Назад"),
                         callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                     )
                 ]
             ]
         )
-        await query.edit_message_text("Счёт добавлен пользователю.", reply_markup=keyboard)
+        await query.edit_message_text(
+            translator.t("Счёт добавлен пользователю."), reply_markup=keyboard
+        )
 
 
 async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    translator, _ = _translator_from_update(update)
 
     data = query.data  # "admin_user_accounts_del:<user_id>" или "...:<user_id>:<account_id>"
     parts = data.split(":")
@@ -590,12 +628,12 @@ async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_
 
         if not user_accounts:
             await query.edit_message_text(
-                "У пользователя нет счетов для удаления.",
+                translator.t("У пользователя нет счетов для удаления."),
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
-                                "⬅️ Назад",
+                                translator.t("⬅️ Назад"),
                                 callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                             )
                         ]
@@ -608,7 +646,7 @@ async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_
         for acc in user_accounts:
             org = get_organization_by_id(acc["organization_id"])
             org_name = org["name"] if org else "?"
-            label = f"{org_name} – {acc['name']}"
+            label = translator.t("{org} – {account}", org=org_name, account=acc["name"])
             keyboard_rows.append(
                 [
                     InlineKeyboardButton(
@@ -621,14 +659,14 @@ async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    "⬅️ Назад",
+                    translator.t("⬅️ Назад"),
                     callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                 )
             ]
         )
 
         await query.edit_message_text(
-            text="Выберите счёт, который нужно удалить у пользователя:",
+            text=translator.t("Выберите счёт, который нужно удалить у пользователя:"),
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
         )
 
@@ -644,40 +682,45 @@ async def admin_user_accounts_del(update: Update, context: ContextTypes.DEFAULT_
             [
                 [
                     InlineKeyboardButton(
-                        "⬅️ Назад",
+                        translator.t("⬅️ Назад"),
                         callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                     )
                 ]
             ]
         )
-        await query.edit_message_text("Счёт удалён у пользователя.", reply_markup=keyboard)
+        await query.edit_message_text(
+            translator.t("Счёт удалён у пользователя."), reply_markup=keyboard
+        )
+
 
 
 async def admin_user_accounts_perm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    translator, _ = _translator_from_update(update)
+
     parts = query.data.split(":")
     if len(parts) < 2:
-        await query.edit_message_text("Некорректный запрос.")
+        await query.edit_message_text(translator.t("Некорректный запрос."))
         return
 
     user_id = int(parts[1])
     user = get_user(user_id)
     if not user:
-        await query.edit_message_text("Пользователь не найден.")
+        await query.edit_message_text(translator.t("Пользователь не найден."))
         return
 
     if len(parts) == 2:
         user_accounts = get_accounts_for_user(user_id)
         if not user_accounts:
             await query.edit_message_text(
-                "У пользователя нет привязанных счетов.",
+                translator.t("У пользователя нет привязанных счетов."),
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
-                                "⬅️ Назад",
+                                translator.t("⬅️ Назад"),
                                 callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                             )
                         ]
@@ -690,13 +733,18 @@ async def admin_user_accounts_perm(update: Update, context: ContextTypes.DEFAULT
         for acc in user_accounts:
             org = get_organization_by_id(acc["organization_id"])
             org_name = org["name"] if org else "?"
-            perm_label = _flows_to_short_label(
-                _flows_from_permissions(acc.get("permissions"))
+            perm_label = _permissions_to_short_label(
+                _permissions_from_value(acc.get("permissions"))
             )
             keyboard_rows.append(
                 [
                     InlineKeyboardButton(
-                        f"{org_name} – {acc['name']} ({perm_label})",
+                        translator.t(
+                            "{org} – {account} ({perm})",
+                            org=org_name,
+                            account=acc["name"],
+                            perm=perm_label,
+                        ),
                         callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{acc['id']}",
                     )
                 ]
@@ -705,93 +753,207 @@ async def admin_user_accounts_perm(update: Update, context: ContextTypes.DEFAULT
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    "⬅️ Назад", callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}"
+                    translator.t("⬅️ Назад"),
+                    callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                 )
             ]
         )
 
         await query.edit_message_text(
-            "Выберите счёт для изменения уровня доступа:",
+            translator.t("Выберите счёт для изменения уровня доступа:"),
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
         )
         return
 
-    if len(parts) == 3:
-        account_id = int(parts[2])
-        acc = get_account_by_id(account_id)
-        if not acc:
-            await query.edit_message_text("Счёт не найден.")
-            return
-        org = get_organization_by_id(acc["organization_id"])
-        org_name = org["name"] if org else "?"
-
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Входящие платежи",
-                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:in",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Исходящие платежи",
-                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:out",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Все",
-                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:all",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}",
-                    )
-                ],
-            ]
-        )
-
-        await query.edit_message_text(
-            f"Счёт: {org_name} – {acc['name']}\nВыберите уровень доступа:",
-            reply_markup=keyboard,
-        )
-        return
-
-    # len >= 4 => финальный выбор
     account_id = int(parts[2])
-    choice = parts[3]
-    mapping = {"in": "in", "out": "out", "all": "in,out"}
-    target = mapping.get(choice)
-    if not target:
-        await query.edit_message_text("Некорректный уровень доступа.")
+    acc = get_account_by_id(account_id)
+    if not acc:
+        await query.edit_message_text("Счёт не найден.")
         return
+    org = get_organization_by_id(acc["organization_id"])
+    org_name = org["name"] if org else "?"
 
-    success = update_user_account_permissions(user_id, account_id, target)
-    if not success:
-        await query.edit_message_text(
-            "Не удалось обновить уровень доступа (возможно, счёт уже удалён)."
-        )
-        return
+    available_tokens = (
+        ("in", "Входящие платежи"),
+        ("out", "Исходящие платежи"),
+        ("balance", "Баланс"),
+    )
 
-    flows = _flows_from_permissions(target)
-    label = _flows_to_short_label(flows)
-    keyboard = InlineKeyboardMarkup(
-        [
+    current_perms = _permissions_from_value(acc.get("permissions"))
+    current_label = _permissions_to_short_label(current_perms)
+    base_text = f"Счёт: {org_name} – {acc['name']}\nТекущий доступ: {current_label}"
+
+    if len(parts) == 3:
+        missing = [token for token, _ in available_tokens if token not in current_perms]
+        existing = [token for token, _ in available_tokens if token in current_perms]
+
+        keyboard: list[list[InlineKeyboardButton]] = []
+        if missing:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "➕ Добавить доступ",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:add",
+                    )
+                ]
+            )
+        if existing:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "➖ Убрать доступ",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:del",
+                    )
+                ]
+            )
+        keyboard.append(
             [
                 InlineKeyboardButton(
                     "⬅️ Назад",
-                    callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}",
+                    callback_data=f"{ADMIN_USER_ACCOUNTS_PREFIX}:{user_id}",
                 )
             ]
-        ]
-    )
-    await query.edit_message_text(
-        f"Уровень доступа обновлён: {label}.",
-        reply_markup=keyboard,
-    )
+        )
+
+        await query.edit_message_text(
+            base_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    action = parts[3]
+    if action == "add":
+        missing = [(t, label) for t, label in available_tokens if t not in current_perms]
+        if len(parts) == 4:
+            if not missing:
+                await query.edit_message_text(
+                    base_text,
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "⬅️ Назад",
+                                    callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                return
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:add:{token}",
+                    )
+                ]
+                for token, label in missing
+            ]
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}",
+                    )
+                ]
+            )
+            await query.edit_message_text(
+                "Выберите доступ, который нужно добавить:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        if len(parts) >= 5:
+            token = parts[4]
+            new_perms = set(current_perms)
+            new_perms.add(token)
+            updated = _permissions_string_from_set(new_perms)
+            success = update_user_account_permissions(user_id, account_id, updated)
+            if not success:
+                await query.edit_message_text("Не удалось обновить уровень доступа.")
+                return
+            label = _permissions_to_short_label(new_perms)
+            await query.edit_message_text(
+                f"Доступ обновлён: {label}.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+    if action == "del":
+        existing = [(t, label) for t, label in available_tokens if t in current_perms]
+        if len(parts) == 4:
+            if not existing:
+                await query.edit_message_text(
+                    base_text,
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "⬅️ Назад",
+                                    callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                return
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}:del:{token}",
+                    )
+                ]
+                for token, label in existing
+            ]
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}",
+                    )
+                ]
+            )
+            await query.edit_message_text(
+                "Какой доступ удалить?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        if len(parts) >= 5:
+            token = parts[4]
+            new_perms = {p for p in current_perms if p != token}
+            updated = _permissions_string_from_set(new_perms)
+            success = update_user_account_permissions(user_id, account_id, updated)
+            if not success:
+                await query.edit_message_text("Не удалось обновить уровень доступа.")
+                return
+            label = _permissions_to_short_label(new_perms)
+            await query.edit_message_text(
+                f"Доступ обновлён: {label}.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data=f"{ADMIN_USER_ACCOUNTS_PERM_PREFIX}:{user_id}:{account_id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+    await query.edit_message_text("Некорректный запрос.")
 # --- approve от админа ---
 
 
@@ -1582,6 +1744,62 @@ async def ask_period_for_payments(
     context.user_data["pay_period_pending"] = account_key
 
 
+async def handle_balance_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: Dict[str, Any]
+):
+    translator = get_translator_for_user(user_row)
+    accounts = get_available_accounts_for_user(user_row)
+    allowed = [
+        acc
+        for acc in accounts
+        if "balance" in (acc.get("access_permissions") or set())
+    ]
+
+    if not allowed:
+        await _reply(update, "У вас нет доступа к балансу ни по одному счёту.")
+        return
+
+    by_org: Dict[int, list[Dict[str, Any]]] = {}
+    for acc in allowed:
+        by_org.setdefault(acc["organization_id"], []).append(acc)
+
+    lines: list[str] = []
+    for org_id, accs in by_org.items():
+        org = get_organization_by_id(org_id)
+        if not org or not org.get("is_active"):
+            continue
+        token = org.get("token")
+        if not token:
+            continue
+        try:
+            info = fetch_client_info(token)
+        except HTTPError:
+            await _reply(update, "Не удалось получить баланс по организациям.")
+            return
+
+        api_accounts = info.get("accounts") or []
+        for acc in accs:
+            api_match = next(
+                (a for a in api_accounts if a.get("id") == acc.get("mono_account_id")),
+                None,
+            )
+            if not api_match:
+                continue
+            balance_value = int(api_match.get("balance", 0)) / 100.0
+            currency_code = api_match.get("currencyCode") or ""
+            org_name = org.get("name") or "?"
+            lines.append(
+                f"{org_name} – {acc['name']}: {balance_value:.2f} {currency_code}"
+            )
+
+    if not lines:
+        await _reply(update, "Не удалось найти данные по балансу.")
+        return
+
+    text = "\n".join(lines)
+    await _reply(update, text)
+
+
 async def pay_acc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1772,7 +1990,7 @@ async def show_payments_for_period(
 
         org_name = org.get("name") or "?"
         card_label = f"{org_name} – {acc['name']}"
-        flows_allowed = acc.get("access_flows") or {"in"}
+        flows_allowed = acc.get("access_permissions") or {"in"}
         allow_in = "in" in flows_allowed
         allow_out = "out" in flows_allowed
 
@@ -2154,7 +2372,7 @@ async def generate_and_send_statement(
                 return
             raise
 
-        flows_allowed = acc.get("access_flows") or {"in"}
+        flows_allowed = acc.get("access_permissions") or {"in"}
         allow_in = "in" in flows_allowed
         allow_out = "out" in flows_allowed
 
@@ -2269,6 +2487,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_row = await ensure_active_user(update, context)
     if not user_row:
         return
+
+    translator = get_translator_for_user(user_row)
 
     admin_mode = context.user_data.get("admin_mode")
     if admin_mode and user_row["role"] == "admin":
@@ -2587,16 +2807,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Обычное меню ---
-    if text == "📥 Платежи":
+    payments_label = translator.t("main.payments")
+    statement_label = translator.t("main.statement")
+    balance_label = translator.t("main.balance")
+    admin_label = translator.t("main.admin")
+
+    if text == payments_label:
         await handle_payments_entry(update, context, user_row)
-    elif text == "📄 Выписка":
+    elif text == statement_label:
         await handle_statement_entry(update, context, user_row)
-    elif text == "🛠 Администрирование" and user_row["role"] == "admin":
+    elif text == balance_label:
+        await handle_balance_entry(update, context, user_row)
+    elif text == admin_label and user_row["role"] == "admin":
         await handle_admin_menu(update, context, user_row)
     else:
         await update.message.reply_text(
             "Выберите действие из меню:",
-            reply_markup=build_main_menu(user_row["role"]),
+            reply_markup=build_main_menu(user_row["role"], translator),
         )
 
 

@@ -1,0 +1,13 @@
+<schema name="statementbot">
+  <table name="users">
+    <column name="id" type="BIGINT UNSIGNED" primaryKey="true" />
+    <column name="full_name" type="VARCHAR(255)" />
+    <column name="username" type="VARCHAR(255)" />
+    <column name="friendly_name" type="VARCHAR(255)" />
+    <column name="language" type="VARCHAR(8)" default="ua" />
+    <column name="role" type="ENUM('pending','manager','accountant','admin','blocked')" default="pending" />
+    <column name="max_days" type="INT" default="3" />
+    <column name="created_at" type="TIMESTAMP" />
+    <column name="updated_at" type="TIMESTAMP" />
+  </table>
+</schema>

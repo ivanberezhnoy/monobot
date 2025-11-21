@@ -11,27 +11,25 @@ from config import DB_CONFIG
 
 def normalize_permissions_value(value: Optional[str]) -> str:
     """
-    Normalizes user_account permissions to one of:
-    - "in"
-    - "out"
-    - "in,out"  (both, order enforced)
-    Falls back to "in" if value doesn't contain valid tokens.
+    Normalizes user_account permissions to a comma-separated combination of
+    supported tokens ("in", "out", "balance").
+
+    Always keeps order as "in,out,balance" and falls back to "in" when
+    nothing valid is provided to keep backward compatibility.
     """
     if not value:
         return "in"
 
     tokens = {chunk.strip().lower() for chunk in value.split(",") if chunk.strip()}
-    valid = []
-    for key in ("in", "out"):
+    valid: list[str] = []
+    for key in ("in", "out", "balance"):
         if key in tokens:
             valid.append(key)
 
     if not valid:
         valid = ["in"]
 
-    if len(valid) == 2:
-        return "in,out"
-    return valid[0]
+    return ",".join(valid)
 
 
 @contextmanager
@@ -82,8 +80,8 @@ def upsert_user_on_start(user_id: int, full_name: str, username: str) -> Dict[st
             else:
                 cur.execute(
                     """
-                    INSERT INTO users (id, full_name, username, role, max_days, friendly_name)
-                    VALUES (%s, %s, %s, 'pending', 3, NULL)
+                    INSERT INTO users (id, full_name, username, role, max_days, friendly_name, language)
+                    VALUES (%s, %s, %s, 'pending', 3, NULL, 'ua')
                     """,
                     (user_id, full_name, username),
                 )
@@ -146,6 +144,19 @@ def update_user_friendly_name(user_id: int, friendly_name: Optional[str]) -> Non
             cur.execute(
                 "UPDATE users SET friendly_name=%s WHERE id=%s",
                 (friendly_name, user_id),
+            )
+        conn.commit()
+
+
+def update_user_language(user_id: int, language: str) -> None:
+    """
+    Updates preferred UI language for the user.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET language=%s WHERE id=%s",
+                (language, user_id),
             )
         conn.commit()
 
