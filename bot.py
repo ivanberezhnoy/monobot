@@ -6,8 +6,6 @@ import logging
 import calendar
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Any, Tuple
-from datetime import datetime, timedelta, date
-from calendar import monthrange
 from html import escape
 
 from requests import HTTPError
@@ -1911,9 +1909,7 @@ async def show_payments_for_period(
         if days > user_row["max_days"] + 1e-6:
             await _reply(
                 source,
-                translator.t(
-                    "errors.period_limit", {"days": user_row["max_days"]}
-                ),
+                translator.t("errors.period_limit", days=user_row["max_days"]),
             )
             log_action(0, "Период превышает допустимый лимит")
             return
@@ -2017,9 +2013,7 @@ async def show_payments_for_period(
                 wait_left = get_statement_wait_left(context, token)
                 msg = translator.t("errors.monobank_rate_limit") + "\n"
                 if wait_left > 0:
-                    msg += translator.t(
-                        "errors.monobank_retry_in", {"seconds": wait_left}
-                    )
+                    msg += translator.t("errors.monobank_retry_in", seconds=wait_left)
                 else:
                     msg += translator.t("errors.monobank_retry_later")
                 await _reply(source, msg)
@@ -2511,13 +2505,16 @@ async def generate_and_send_statement(
         log_action(0, "Не удалось определить chat_id для отправки файла")
         return
 
+    caption = translator.t(
+        "statement.file_caption",
+        **{"from": from_raw, "to": to_raw},  # из-за зарезервированного from — только так
+    )
+
     await context.bot.send_document(
         chat_id=chat_id,
         document=open(output_path, "rb"),
         filename=filename,
-        caption=translator.t(
-            "statement.file_caption", {"from": from_raw, "to": to_raw}
-        ),
+        caption=caption,
     )
 
     log_action(1, filename)
@@ -2800,7 +2797,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_raw, to_raw = parse_custom_period_input(text)
         except ValueError:
             await update.message.reply_text(
-                CUSTOM_PERIOD_HELP,
+                get_custom_period_help(translator),
                 parse_mode="Markdown",
             )
             return
@@ -2819,7 +2816,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_raw, to_raw = parse_custom_period_input(text)
         except ValueError:
             await update.message.reply_text(
-                CUSTOM_PERIOD_HELP,
+                get_custom_period_help(translator),
                 parse_mode="Markdown",
             )
             return
@@ -2845,7 +2842,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_raw, to_raw = parse_custom_period_input(text)
         except ValueError:
             await update.message.reply_text(
-                CUSTOM_PERIOD_HELP,
+                get_custom_period_help(translator),
                 parse_mode="Markdown",
             )
             return
@@ -2869,7 +2866,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_raw, to_raw = parse_custom_period_input(text)
         except ValueError:
             await update.message.reply_text(
-                CUSTOM_PERIOD_HELP,
+                get_custom_period_help(translator),
                 parse_mode="Markdown",
             )
             return
